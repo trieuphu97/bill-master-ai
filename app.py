@@ -156,7 +156,7 @@ with tab1:
                 # Logic Auto-Scan (Giữ nguyên logic cũ nhưng bọc trong spinner đẹp hơn)
                 if 'last_file' not in st.session_state or st.session_state.last_file != file.name:
                     genai.configure(api_key=API_KEY)
-                    model = genai.GenerativeModel('gemini-2.0-flash') # Hoặc bản bạn đang dùng
+                    model = genai.GenerativeModel('gemini-1.5-flash') # Hoặc bản bạn đang dùng
                     with st.status("🚀 Đang phân tích hóa đơn...", expanded=True) as status:
                         try:
                             img = Image.open(file)
