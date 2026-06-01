@@ -10,13 +10,6 @@ import os
 API_KEY = st.secrets["GEMINI_API_KEY"]
 DB_NAME = st.secrets["DB_NAME"]
 
-genai.configure(api_key=API_KEY)
-
-print("Danh sách các model bạn có thể dùng:")
-for m in genai.list_models():
-    if 'generateContent' in m.supported_generation_methods:
-        print(m.name)
-
 # --- DATABASE LOGIC (Giữ nguyên) ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -163,7 +156,7 @@ with tab1:
                 # Logic Auto-Scan (Giữ nguyên logic cũ nhưng bọc trong spinner đẹp hơn)
                 if 'last_file' not in st.session_state or st.session_state.last_file != file.name:
                     genai.configure(api_key=API_KEY)
-                    model = genai.GenerativeModel('gemini-2.0-flash') # Hoặc bản bạn đang dùng
+                    model = genai.GenerativeModel('gemini-2.5-flash') # Hoặc bản bạn đang dùng
                     with st.status("🚀 Đang phân tích hóa đơn...", expanded=True) as status:
                         try:
                             img = Image.open(file)
