@@ -9,21 +9,49 @@ import os
 # --- CẤU HÌNH ---
 API_KEY = st.secrets["GEMINI_API_KEY"]
 DB_NAME = st.secrets["DB_NAME"]
+IMAGE_STORE_DIR = "saved_bills"  # Thư mục lưu file ảnh trên server/host
 
-# --- DATABASE LOGIC (Giữ nguyên) ---
+# Tự động tạo thư mục lưu ảnh nếu chưa tồn tại
+if not os.path.exists(IMAGE_STORE_DIR):
+    os.makedirs(IMAGE_STORE_DIR)
+
+
+# --- DATABASE LOGIC (CẬP NHẬT THÊM CỘT IMAGE_PATH) ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, title TEXT)')
+    # Thêm cột image_path vào bảng sessions để lưu đường dẫn ảnh
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            date TEXT, 
+            title TEXT,
+            image_path TEXT
+        )
+    ''')
     c.execute('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, content TEXT, is_paid INTEGER)')
     conn.commit()
     conn.close()
 
-def save_bill(title, items_list):
+def save_bill(title, items_list, uploaded_file):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     date_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-    c.execute("INSERT INTO sessions (date, title) VALUES (?, ?)", (date_str, title))
+    
+    # Xử lý lưu file ảnh gốc
+    image_path = ""
+    if uploaded_file is not None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_extension = os.path.splitext(uploaded_file.name)[1]
+        saved_filename = f"bill_{timestamp}{file_extension}"
+        image_path = os.path.join(IMAGE_STORE_DIR, saved_filename)
+        
+        # Ghi dữ liệu ảnh vào thư mục
+        with open(image_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+            
+    # Chèn thông tin kèm đường dẫn ảnh vào DB
+    c.execute("INSERT INTO sessions (date, title, image_path) VALUES (?, ?, ?)", (date_str, title, image_path))
     session_id = c.lastrowid
     for item in items_list:
         if item.strip():
@@ -34,6 +62,16 @@ def save_bill(title, items_list):
 def delete_session(session_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    
+    # Lấy đường dẫn ảnh cũ để xóa file vật lý tránh rác bộ nhớ
+    c.execute("SELECT image_path FROM sessions WHERE id = ?", (session_id,))
+    row = c.fetchone()
+    if row and row[0] and os.path.exists(row[0]):
+        try:
+            os.remove(row[0])
+        except Exception:
+            pass
+
     c.execute("DELETE FROM items WHERE session_id = ?", (session_id,))
     c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     conn.commit()
@@ -42,10 +80,26 @@ def delete_session(session_id):
 def delete_all_history():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    
+    # Xóa sạch toàn bộ file ảnh trong thư mục lưu trữ
+    if os.path.exists(IMAGE_STORE_DIR):
+        for filename in os.listdir(IMAGE_STORE_DIR):
+            file_path = os.path.join(IMAGE_STORE_DIR, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                
     c.execute("DELETE FROM items")
     c.execute("DELETE FROM sessions")
     conn.commit()
     conn.close()
+
+# --- POPUP XEM ẢNH HÓA ĐƠN GỐC ---
+@st.dialog("🖼️ Ảnh hóa đơn gốc")
+def show_image_popup(img_path):
+    if os.path.exists(img_path):
+        st.image(img_path, use_container_width=True)
+    else:
+        st.error("Không tìm thấy file ảnh gốc trên hệ thống.")
 
 # --- GIAO DIỆN (NÂNG CẤP TAB & LAYOUT) ---
 st.set_page_config(page_title="Bill Master", layout="wide")
@@ -139,24 +193,25 @@ st.markdown('<div class="header-container"><h1>🧾 Bill Master AI</h1><p style=
 
 tab1, tab2 = st.tabs(["✨ QUÉT MỚI", "📁 LỊCH SỬ"])
 
-# --- TAB 1: QUÉT BILL ---
-# --- TAB 1: QUÉT BILL MỚI (REDESIGN) ---
+# --- TAB 1: QUÉT BILL MỚI ---
 with tab1:
-    # Chia bố cục chính: Bên trái Tải ảnh - Bên phải Kết quả
     col_upload, col_result = st.columns([1, 1.2], gap="large")
     
+    # Khởi tạo khóa ngẫu nhiên cho uploader để có thể chủ động reset xóa ảnh
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
+
     with col_upload:
         st.markdown("### 📸 Bước 1: Tải hóa đơn")
-        # Sử dụng container để bao quanh vùng upload cho đẹp
         with st.container(border=True):
-            file = st.file_uploader("Kéo thả ảnh bill vào đây", type=["jpg", "png", "jpeg"], label_visibility="visible")
+            file = st.file_uploader("Kéo thả ảnh bill vào đây", type=["jpg", "png", "jpeg"], key=f"uploader_{st.session_state.uploader_key}", label_visibility="visible")
             if file:
                 st.image(file, use_container_width=True, caption="Hóa đơn đã tải lên")
                 
-                # Logic Auto-Scan (Giữ nguyên logic cũ nhưng bọc trong spinner đẹp hơn)
+                # Logic Auto-Scan
                 if 'last_file' not in st.session_state or st.session_state.last_file != file.name:
                     genai.configure(api_key=API_KEY)
-                    model = genai.GenerativeModel('gemini-2.5-flash') # Hoặc bản bạn đang dùng
+                    model = genai.GenerativeModel('gemini-2.5-flash')
                     with st.status("🚀 Đang phân tích hóa đơn...", expanded=True) as status:
                         try:
                             img = Image.open(file)
@@ -175,34 +230,33 @@ with tab1:
         if 'current_items' in st.session_state:
             st.info("💡 Bạn có thể sửa trực tiếp nội dung bên dưới nếu AI đọc sai hoặc thiếu tên.")
 
-            # Tạo một danh sách mới để lưu nội dung sau khi bạn đã sửa
             updated_items = []
-            
-            # Duyệt qua từng item mà AI đã đọc được
             for i, item in enumerate(st.session_state.current_items):
-                # Tạo ô nhập liệu cho từng dòng, cho phép bạn sửa lỗi ngay tại đây
                 new_val = st.text_input(f"Món {i+1}", value=item, key=f"edit_{i}")
                 updated_items.append(new_val)
             
-            # Nút thêm dòng mới (trường hợp hóa đơn thiếu hẳn thông tin)
             if st.button("➕ Thêm người/món mới"):
                 st.session_state.current_items.append("Tên: Món ăn - 0.000")
                 st.rerun()
 
             st.write("---")
-            
-            # Phần nhập tên đợt thu và lưu
-            title = st.text_input("Tên đợt thu tiền:", value=f"Bill ngày {datetime.now().strftime('%d/%m')}")
+            title = st.text_input("Tên đợt thu tiền:", value=f"Bill ngày {datetime.now().strftime('%d/%m')}", key="bill_title_input")
             
             if st.button("💾 XÁC NHẬN & LƯU", type="primary", use_container_width=True):
-                # Lưu danh sách ĐÃ CHỈNH SỬA (updated_items) chứ không lưu danh sách cũ của AI
-                save_bill(title, updated_items)
+                # Gọi hàm lưu hóa đơn kèm file ảnh
+                save_bill(title, updated_items, file)
                 st.balloons()
-                st.success("Đã lưu dữ liệu chính xác!")
+                
+                # --- TIẾN HÀNH RESET TOÀN BỘ TRẠNG THÁI VỀ ĐẦU TRANG ---
                 del st.session_state.current_items
+                if 'last_file' in st.session_state:
+                    del st.session_state.last_file
+                # Thay đổi key uploader để Streamlit ép buộc dọn file ảnh cũ trên UI
+                st.session_state.uploader_key += 1 
+                
+                st.success("Đã lưu dữ liệu chính xác và reset giao diện thành công!")
                 st.rerun()
         else:
-            # Thông báo khi chưa có dữ liệu
             st.info("Hệ thống đang chờ bạn tải ảnh lên để bắt đầu phân tích...")
             st.markdown("""
                 <div style="text-align: center; padding: 40px; color: #666;">
@@ -232,13 +286,23 @@ with tab2:
             header = f"{'✅' if is_done else '🔴'} {session['title']} ({p_count}/{t_count})"
             
             with st.expander(header, expanded=not is_done):
-                # 1. Thông tin ngày tháng nằm riêng một hàng trên cùng
-                st.caption(f"📅 {session['date']}")
+                # Tạo 2 cột: Cột trái hiện thông tin ngày, Cột phải hiện nút popup xem ảnh gốc
+                top_c1, top_c2 = st.columns([3, 1])
+                with top_c1:
+                    st.caption(f"📅 {session['date']}")
+                with top_c2:
+                    img_path = session.get('image_path', '')
+                    if img_path and os.path.exists(img_path):
+                        # Khi người dùng nhấn nút này, Popup Dialog xem ảnh sẽ xuất hiện
+                        if st.button("🔍 Xem ảnh gốc", key=f"view_img_{session['id']}", use_container_width=True):
+                            show_image_popup(img_path)
+                    else:
+                        st.caption("Không có ảnh gốc")
+                        
                 st.progress(p_count/t_count if t_count > 0 else 0)
-                
-                st.write("") # Tạo khoảng cách nhẹ
+                st.write("") 
 
-                # 2. Danh sách món nợ
+                # Danh sách món nợ công nợ
                 cols = st.columns(2)
                 for i, (_, item) in enumerate(items.iterrows()):
                     with cols[i % 2]:
@@ -250,8 +314,8 @@ with tab2:
                             conn.close()
                             st.rerun()
                 
-                # 3. Nút xóa đẩy xuống dưới cùng bên phải
-                st.write("---") # Đường kẻ mờ phân cách
+                # Nút xóa hóa đơn dài hết cỡ
+                st.write("---") 
                 if st.button("🗑️ Xóa hóa đơn này", key=f"del_{session['id']}", use_container_width=True, help="Xóa hóa đơn này vĩnh viễn"):
                     delete_session(session['id'])
                     st.toast(f" Đã xóa hóa đơn: {session['title']}")
