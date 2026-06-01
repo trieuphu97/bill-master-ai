@@ -4,10 +4,11 @@ from PIL import Image
 import sqlite3
 from datetime import datetime
 import pandas as pd
+import os
 
 # --- CẤU HÌNH ---
-API_KEY = "AIzaSyCMPp3lbruW4VcgQC2gt27BfjvxloNc-yg"
-DB_NAME = "bill_database.db"
+API_KEY = st.secrets["GEMINI_API_KEY"]
+DB_NAME = st.secrets["DB_NAME"]
 
 # --- DATABASE LOGIC (Giữ nguyên) ---
 def init_db():
