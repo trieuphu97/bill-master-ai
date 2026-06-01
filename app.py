@@ -173,7 +173,6 @@ with tab1:
         st.markdown("### 📝 Bước 2: Kiểm tra & Lưu")
         
         if 'current_items' in st.session_state:
-            st.markdown("### 📝 Bước 2: Kiểm tra & Chỉnh sửa")
             st.info("💡 Bạn có thể sửa trực tiếp nội dung bên dưới nếu AI đọc sai hoặc thiếu tên.")
 
             # Tạo một danh sách mới để lưu nội dung sau khi bạn đã sửa
