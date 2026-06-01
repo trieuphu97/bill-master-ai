@@ -102,6 +102,23 @@ def show_image_popup(img_path):
     else:
         st.error("Không tìm thấy file ảnh gốc trên hệ thống.")
 
+# Hàm giúp tự động cuộn màn hình xuống vùng kiểm tra & lưu (Dành cho Mobile)
+def scroll_to_result():
+    st.components.v1.html(
+        """
+        <script>
+            // Chờ một chút để Streamlit dựng giao diện xong rồi cuộn
+            setTimeout(function() {
+                window.scrollTo({
+                    top: document.body.scrollHeight / 2, // Cuộn xuống giữa trang nơi có kết quả
+                    behavior: 'smooth' // Hiệu ứng cuộn mượt mà
+                });
+            }, 500);
+        </script>
+        """,
+        height=0, # Ẩn thành phần này đi để không làm xấu giao diện
+    )
+
 # --- GIAO DIỆN (NÂNG CẤP TAB & LAYOUT) ---
 st.set_page_config(page_title="Bill Master", layout="wide")
 init_db()
@@ -221,6 +238,7 @@ with tab1:
                             st.session_state.current_items = response.text.strip().split('\n')
                             st.session_state.last_file = file.name
                             status.update(label="✅ Đã phân tích xong!", state="complete", expanded=False)
+                            scroll_to_result()
                         except Exception as e:
                             status.update(label="❌ Lỗi phân tích", state="error")
                             st.error(f"Chi tiết: {e}")
