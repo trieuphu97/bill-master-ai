@@ -20,16 +20,17 @@ if not os.path.exists(IMAGE_STORE_DIR):
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Thêm cột image_path vào bảng sessions để lưu đường dẫn ảnh
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            date TEXT, 
-            title TEXT,
-            image_path TEXT
-        )
-    ''')
+    # 1. Tạo bảng sessions theo cấu trúc cơ bản nếu chưa có
+    c.execute('CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, title TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, content TEXT, is_paid INTEGER)')
+    
+    # 2. Cơ chế tự động kiểm tra và "vá" thêm cột image_path nếu database cũ chưa có
+    try:
+        c.execute("SELECT image_path FROM sessions LIMIT 1")
+    except sqlite3.OperationalError:
+        # Nếu lỗi nghĩa là cột image_path chưa tồn tại -> Tiến hành thêm cột vào bảng
+        c.execute("ALTER TABLE sessions ADD COLUMN image_path TEXT")
+        
     conn.commit()
     conn.close()
 
