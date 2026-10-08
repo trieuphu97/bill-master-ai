@@ -1,3 +1,6 @@
 pandas
 pillow
 google-generativeai
+streamlit>=1.37
+openpyxl
+qrcode

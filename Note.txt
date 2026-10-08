@@ -1,0 +1,19 @@
+Các phần đã bổ sung:
+Quản lý thành viên, biệt danh, phòng ban và tài khoản ngân hàng.
+Ghi nhận người ứng tiền và nhiều người cùng ứng.
+Tách rõ người đặt, món, số lượng, đơn giá và số tiền phải trả.
+Chia phí ship, tip, voucher và khoản công ty hỗ trợ.
+Chia đều hoặc theo tỷ lệ giá món.
+Thanh toán từng phần/toàn bộ và lưu lịch sử thanh toán.
+Dashboard tổng chi tiêu, đã thu và còn nợ.
+Tìm kiếm theo đơn, quán hoặc thành viên.
+Lọc theo trạng thái và người ứng tiền.
+Báo cáo Excel và CSV.
+Link và QR chia sẻ từng đơn.
+Webhook gửi nhắc nợ qua Slack/Teams.
+Mật khẩu bảo vệ ứng dụng.
+Xác nhận trước khi xóa.
+Backup database và ảnh thành ZIP.
+Migration tự động dữ liệu phiên bản cũ.
+Sửa toàn bộ lỗi mã hóa tiếng Việt.
+Thêm kiểm thử tự động.

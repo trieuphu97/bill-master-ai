@@ -1,0 +1,6 @@
+.streamlit/secrets.toml
+*.db
+*.db-journal
+saved_bills/
+__pycache__/
+*.py[cod]
