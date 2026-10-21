@@ -3,10 +3,235 @@ import unittest
 from pathlib import Path
 
 from database import Database
-from services import allocate_group, allocate_items, person_balances
+from services import allocate_group, allocate_items, allocate_items_with_shared_promos, person_balances, shared_promo_discount
 
 
 class BillingTests(unittest.TestCase):
+    def test_one_dong_item_uses_original_price_and_shares_savings(self):
+        prices = [69_000, 54_000, 54_000, 54_000, 1, 54_000, 69_000]
+        items = [
+            {"person_name": f"Người {index}", "item_name": f"Món {index}",
+             "quantity": 1, "unit_price": price,
+             "promo_original_price": 54_000 if price == 1 else None}
+            for index, price in enumerate(prices)
+        ]
+        allocated = allocate_items_with_shared_promos(items, shipping_fee=16_000,
+                                                       discount=77_880, tip=3_000)
+        self.assertEqual(shared_promo_discount(items), 53_999)
+        self.assertEqual(sum(row["amount_due"] for row in allocated), 295_121)
+        self.assertEqual(allocated[4]["unit_price"], 1)
+        self.assertEqual(allocated[4]["promo_original_price"], 54_000)
+        self.assertGreater(allocated[4]["amount_due"], 1)
+        self.assertLess(allocated[4]["amount_due"], 54_000)
+
+    def test_shared_item_promo_survives_create_and_edit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "promo.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            raw = [
+                {"member_id": payer, "person_name": "An", "item_name": "Trà thường",
+                 "quantity": 1, "unit_price": 54_000},
+                {"member_id": guest, "person_name": "Bình", "item_name": "Trà 1đ",
+                 "quantity": 1, "unit_price": 1, "promo_original_price": 54_000},
+            ]
+            data = {"title": "Ưu đãi chung", "payer_member_id": payer,
+                    "subtotal": 54_001, "shipping_fee": 0, "discount": 0,
+                    "tip": 0, "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(
+                data, allocate_items_with_shared_promos(raw), [],
+            )
+            rows = database.query("SELECT * FROM items WHERE session_id=? ORDER BY id", (session_id,))
+            self.assertEqual((rows[1]["unit_price"], rows[1]["promo_original_price"]), (1, 54_000))
+            self.assertEqual(sum(row["amount_due"] for row in rows), 54_001)
+            database.init()
+            self.assertEqual(database.query("SELECT promo_original_price FROM items WHERE id=?", (rows[1]["id"],))[0]["promo_original_price"], 54_000)
+            revised = [dict(row) for row in rows]
+            revised[1]["promo_original_price"] = 60_000
+            calculated = allocate_items_with_shared_promos(revised)
+            revision = database.query("SELECT revision FROM sessions WHERE id=?", (session_id,))[0]["revision"]
+            database.update_session(session_id, revision, data, calculated)
+            updated = database.query("SELECT unit_price,promo_original_price,amount_due FROM items WHERE session_id=? ORDER BY id", (session_id,))
+            self.assertEqual((updated[1]["unit_price"], updated[1]["promo_original_price"]), (1, 60_000))
+            self.assertEqual(sum(row["amount_due"] for row in updated), 54_001)
+
+    def test_duplicate_detection_ignores_item_order_and_accents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "duplicates.db")
+            database.init()
+            payer = database.add_member("An")
+            items = allocate_items([
+                {"member_id": payer, "person_name": "An", "item_name": "Trà sữa", "quantity": 2, "unit_price": 30000},
+                {"member_id": payer, "person_name": "An", "item_name": "Bánh mì", "quantity": 1, "unit_price": 20000},
+            ])
+            data = {"title": "Bữa sáng", "restaurant": "Quán Trà", "payer_member_id": payer,
+                    "subtotal": 80000, "shipping_fee": 0, "discount": 0, "tip": 0,
+                    "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 80000}])
+            reversed_items = list(reversed(items))
+            self.assertEqual(
+                [row["id"] for row in database.find_possible_duplicates("quan tra", reversed_items, 80000)],
+                [session_id],
+            )
+            split_drinks = [
+                {"item_name": "Trà sữa", "quantity": 1, "unit_price": 30000},
+                {"item_name": "Bánh mì", "quantity": 1, "unit_price": 20000},
+                {"item_name": "Trà sữa", "quantity": 1, "unit_price": 30000},
+            ]
+            self.assertEqual(len(database.find_possible_duplicates("Quán Trà", split_drinks, 80000)), 1)
+            self.assertFalse(database.find_possible_duplicates("quan tra", reversed_items, 81000))
+            self.assertFalse(database.find_possible_duplicates("quán khác", reversed_items, 80000))
+
+    def test_edit_bill_keeps_payments_and_rejects_overpayment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "edit.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            items = allocate_items([
+                {"member_id": payer, "person_name": "An", "item_name": "Cơm", "quantity": 1, "unit_price": 40000},
+                {"member_id": guest, "person_name": "Bình", "item_name": "Trà", "quantity": 1, "unit_price": 60000},
+            ])
+            data = {"title": "Trưa", "restaurant": "Quán", "payer_member_id": payer,
+                    "subtotal": 100000, "shipping_fee": 0, "discount": 0, "tip": 0,
+                    "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 100000}])
+            database.add_payment(session_id, guest, "Bình", 30000, "Chuyển khoản")
+            payment_id = database.query("SELECT id FROM payments WHERE member_id=? AND method<>'Tự đối trừ'", (guest,))[0]["id"]
+            current = database.query("SELECT * FROM sessions WHERE id=?", (session_id,))[0]
+            revised = database.query("SELECT * FROM items WHERE session_id=? ORDER BY id", (session_id,))
+            revised[1]["unit_price"] = 20000
+            revised[1]["amount_due"] = 20000
+            lower = {**data, "subtotal": 60000, "title": "Trưa đã sửa"}
+            with self.assertRaisesRegex(ValueError, "vượt"):
+                database.update_session(session_id, current["revision"], lower, revised)
+            self.assertEqual(database.query("SELECT subtotal FROM sessions WHERE id=?", (session_id,))[0]["subtotal"], 100000)
+            database.update_payment(payment_id, 10000, "Tiền mặt", "Đã đối chiếu", "Nhập dư 20,000")
+            fresh = database.query("SELECT revision FROM sessions WHERE id=?", (session_id,))[0]
+            database.update_session(session_id, fresh["revision"], lower, revised)
+            self.assertEqual(database.query("SELECT amount FROM payments WHERE id=?", (payment_id,))[0]["amount"], 10000)
+            self.assertEqual(database.query("SELECT amount FROM advances WHERE session_id=?", (session_id,))[0]["amount"], 60000)
+            self.assertEqual(database.query("SELECT status FROM sessions WHERE id=?", (session_id,))[0]["status"], "open")
+            self.assertEqual(len(database.query("SELECT * FROM audit_log WHERE action='edit' AND entity_type='session'")), 1)
+            with self.assertRaisesRegex(ValueError, "Tải lại"):
+                database.update_session(session_id, current["revision"], lower, revised)
+            database.delete_payment(payment_id, "Giao dịch chưa thực hiện")
+            self.assertFalse(database.query("SELECT * FROM payments WHERE id=?", (payment_id,)))
+            self.assertEqual(database.query("SELECT status FROM sessions WHERE id=?", (session_id,))[0]["status"], "open")
+            self.assertEqual(
+                len(database.query("SELECT * FROM audit_log WHERE entity_type='payment' AND entity_id=?", (payment_id,))),
+                2,
+            )
+
+    def test_edit_preserves_claims_and_checks_claimed_quantity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "claimed.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            items = allocate_items([
+                {"member_id": None, "person_name": "Chưa xác định", "item_name": "Trà", "quantity": 2, "unit_price": 30000}
+            ])
+            data = {"title": "Trà", "restaurant": "Quán", "payer_member_id": payer,
+                    "subtotal": 60000, "shipping_fee": 0, "discount": 0, "tip": 0,
+                    "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 60000}])
+            row = database.query("SELECT * FROM items WHERE session_id=?", (session_id,))[0]
+            database.claim_item(row["id"], guest, 2)
+            current = database.query("SELECT revision FROM sessions WHERE id=?", (session_id,))[0]
+            with self.assertRaisesRegex(ValueError, "đã được nhận"):
+                database.update_session(session_id, current["revision"], data, [{**row, "quantity": 1}])
+            updated = {**row, "item_name": "Trà đào"}
+            database.update_session(session_id, current["revision"], data, [updated])
+            self.assertEqual(database.query("SELECT quantity FROM item_claims WHERE item_id=?", (row["id"],))[0]["quantity"], 2)
+            self.assertEqual(database.query("SELECT item_name FROM items WHERE id=?", (row["id"],))[0]["item_name"], "Trà đào")
+
+    def test_payment_cannot_exceed_remaining_or_edit_auto_credit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "money.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            items = allocate_items([{"member_id": guest, "person_name": "Bình", "item_name": "Trà",
+                                     "quantity": 1, "unit_price": 30000}])
+            data = {"title": "Trà", "payer_member_id": payer, "subtotal": 30000,
+                    "shipping_fee": 0, "discount": 0, "tip": 0, "company_support": 0,
+                    "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 30000}])
+            with self.assertRaisesRegex(ValueError, "vượt"):
+                database.add_payment(session_id, guest, "Bình", 30001, "Chuyển khoản")
+            self.assertFalse(database.query("SELECT * FROM payments WHERE session_id=?", (session_id,)))
+            database.add_payment(session_id, guest, "Bình", 30000, "Chuyển khoản")
+            self.assertEqual(database.query("SELECT status FROM sessions WHERE id=?", (session_id,))[0]["status"], "settled")
+            payment_id = database.query("SELECT id FROM payments WHERE session_id=?", (session_id,))[0]["id"]
+            with self.assertRaisesRegex(ValueError, "vượt"):
+                database.update_payment(payment_id, 30001, "Chuyển khoản", "", "Nhập lại số tiền")
+            self.assertEqual(database.query("SELECT amount FROM payments WHERE id=?", (payment_id,))[0]["amount"], 30000)
+
+    def test_group_equal_edit_recalculates_contributions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "group-edit.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            source = allocate_items([{"member_id": None, "person_name": "Chưa xác định",
+                                      "item_name": "Bánh sinh nhật", "quantity": 1, "unit_price": 100000}])
+            source[0]["amount_due"] = 0
+            group = allocate_group([{"id": payer, "name": "An"}, {"id": guest, "name": "Bình"}], 100000)
+            data = {"title": "Sinh nhật", "restaurant": "Tiệm bánh", "payer_member_id": payer,
+                    "subtotal": 100000, "shipping_fee": 0, "discount": 0, "tip": 0,
+                    "company_support": 0, "allocation_method": "group_equal"}
+            session_id = database.create_session(data, source + group,
+                                                 [{"member_id": payer, "person_name": "An", "amount": 100000}])
+            rows = database.query("SELECT * FROM items WHERE session_id=? ORDER BY id", (session_id,))
+            rows[0]["unit_price"] = 120000
+            group[0]["amount_due"] = group[0]["unit_price"] = 60000
+            group[1]["amount_due"] = group[1]["unit_price"] = 60000
+            rows[1]["amount_due"] = rows[1]["unit_price"] = 60000
+            rows[2]["amount_due"] = rows[2]["unit_price"] = 60000
+            current = database.query("SELECT revision FROM sessions WHERE id=?", (session_id,))[0]
+            database.update_session(session_id, current["revision"], {**data, "subtotal": 120000}, rows)
+            self.assertEqual(database.query("SELECT SUM(amount_due) total FROM items WHERE session_id=?",
+                                            (session_id,))[0]["total"], 120000)
+            self.assertEqual(database.query("SELECT amount FROM payments WHERE method='Tự đối trừ' AND session_id=?",
+                                            (session_id,))[0]["amount"], 60000)
+
+    def test_unclaim_rejected_after_payment_without_losing_claim(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "paid-claim.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            items = allocate_items([{"member_id": None, "person_name": "Chưa xác định",
+                                     "item_name": "Trà", "quantity": 1, "unit_price": 30000}])
+            data = {"title": "Trà", "payer_member_id": payer, "subtotal": 30000, "shipping_fee": 0,
+                    "discount": 0, "tip": 0, "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 30000}])
+            item_id = database.query("SELECT id FROM items WHERE session_id=?", (session_id,))[0]["id"]
+            database.claim_item(item_id, guest, 1)
+            database.add_payment(session_id, guest, "Bình", 30000, "Chuyển khoản")
+            with self.assertRaisesRegex(ValueError, "Không thể bỏ nhận"):
+                database.remove_claim(item_id, guest)
+            self.assertEqual(database.query("SELECT quantity FROM item_claims WHERE item_id=?", (item_id,))[0]["quantity"], 1)
+
+    def test_claim_does_not_move_already_paid_unknown_debt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "unknown-paid.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            items = allocate_items([{"member_id": None, "person_name": "Chưa xác định",
+                                     "item_name": "Trà", "quantity": 1, "unit_price": 30000}])
+            data = {"title": "Trà", "payer_member_id": payer, "subtotal": 30000, "shipping_fee": 0,
+                    "discount": 0, "tip": 0, "company_support": 0, "allocation_method": "equal"}
+            session_id = database.create_session(data, items, [{"member_id": payer, "person_name": "An", "amount": 30000}])
+            item_id = database.query("SELECT id FROM items WHERE session_id=?", (session_id,))[0]["id"]
+            database.add_payment(session_id, None, "Chưa xác định", 30000, "Chuyển khoản")
+            with self.assertRaisesRegex(ValueError, "Hãy sửa khoản thanh toán"):
+                database.claim_item(item_id, guest, 1)
+            self.assertFalse(database.query("SELECT * FROM item_claims WHERE item_id=?", (item_id,)))
+
     def test_proportional_allocation_keeps_exact_total(self):
         items = [
             {"person_name": "An", "item_name": "Cơm", "quantity": 1, "unit_price": 40_000},
@@ -21,6 +246,15 @@ class BillingTests(unittest.TestCase):
         items = [{"person_name": str(i), "item_name": "Món", "quantity": 1, "unit_price": 10_000} for i in range(3)]
         result = allocate_items(items, shipping_fee=10_000, method="equal")
         self.assertEqual(sum(x["amount_due"] for x in result), 40_000)
+
+    def test_discount_larger_than_cheap_item_preserves_total(self):
+        items = [
+            {"person_name": "An", "item_name": "Cơm", "quantity": 1, "unit_price": 10000},
+            {"person_name": "Bình", "item_name": "Kẹo", "quantity": 1, "unit_price": 1000},
+        ]
+        result = allocate_items(items, discount=10000, method="equal")
+        self.assertEqual(sum(item["amount_due"] for item in result), 1000)
+        self.assertTrue(all(item["amount_due"] >= 0 for item in result))
 
     def test_partial_payment_balance(self):
         rows = [{"member_id": 1, "person_name": "An", "amount_due": 50_000}]
@@ -71,6 +305,56 @@ class BillingTests(unittest.TestCase):
         result = allocate_group(people, 1_000_003)
         self.assertEqual(sum(x["amount_due"] for x in result), 1_000_003)
         self.assertEqual([x["amount_due"] for x in result], [200_001, 200_001, 200_001, 200_000, 200_000])
+
+    def test_group_source_prices_survive_database_reinitialization(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "group.db")
+            database.init()
+            payer = database.add_member("An")
+            items = [
+                {"member_id": None, "person_name": "Chưa xác định", "item_name": "Trà",
+                 "quantity": 1, "unit_price": 34_000, "allocated_fee": 0,
+                 "allocated_discount": 0, "amount_due": 0},
+                {"member_id": payer, "person_name": "An", "item_name": "Phần đóng góp chi phí chung",
+                 "quantity": 1, "unit_price": 34_000, "allocated_fee": 0,
+                 "allocated_discount": 0, "amount_due": 34_000},
+            ]
+            data = {"title": "Bao cả nhóm", "payer_member_id": payer, "subtotal": 34_000,
+                    "shipping_fee": 0, "discount": 0, "tip": 0,
+                    "company_support": 0, "allocation_method": "group_equal"}
+            session_id = database.create_session(data, items, [])
+            database.init()
+            database.init()
+            rows = database.query("SELECT item_name, unit_price, amount_due FROM items WHERE session_id=? ORDER BY id", (session_id,))
+            self.assertEqual(rows[0]["unit_price"], 34_000)
+            self.assertEqual(rows[0]["amount_due"], 0)
+            self.assertEqual(rows[1]["amount_due"], 34_000)
+
+    def test_history_page_filters_and_limits_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "history.db")
+            database.init()
+            payer = database.add_member("An")
+            guest = database.add_member("Bình")
+            for number in range(12):
+                items = allocate_items([{"member_id": guest, "person_name": "Bình",
+                                         "item_name": "Trà", "quantity": 1, "unit_price": 10_000}])
+                data = {"title": f"Đơn {number}", "restaurant": "Quán",
+                        "payer_member_id": payer, "subtotal": 10_000, "shipping_fee": 0,
+                        "discount": 0, "tip": 0, "company_support": 0,
+                        "allocation_method": "equal"}
+                session_id = database.create_session(data, items, [])
+                if number == 0:
+                    database.add_payment(session_id, guest, "Bình", 10_000, "Chuyển khoản")
+            count, first = database.history_page(page=1, page_size=5)
+            self.assertEqual((count, len(first)), (12, 5))
+            self.assertEqual([row["id"] for row in first], [12, 11, 10, 9, 8])
+            self.assertEqual([row["id"] for row in database.history_page(page=3, page_size=5)[1]], [2, 1])
+            self.assertEqual(database.history_page(keyword="don 7")[0], 1)
+            self.assertEqual(database.history_page(keyword="binh")[0], 12)
+            self.assertEqual(database.history_page(status="Đã thu đủ")[0], 1)
+            self.assertEqual(database.history_page(status="Chưa thu đủ")[0], 11)
+            self.assertEqual(database.history_page(payer="Bình")[0], 0)
 
     def test_custom_group_allocation_must_match_total(self):
         people = [{"id": 1, "name": "An"}, {"id": 2, "name": "Bình"}]

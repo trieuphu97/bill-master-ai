@@ -5,6 +5,10 @@
 ## Chức năng
 
 - AI đọc ảnh hóa đơn, sau đó cho phép kiểm tra và sửa từng món.
+- Món giá ưu đãi (ví dụ 1đ): giữ giá thực trả trên hóa đơn, nhập giá gốc để chia phần chênh lệch như giảm giá chung.
+- Cảnh báo hóa đơn có thể bị lưu trùng dựa trên quán, danh sách món, tổng tiền và thời điểm.
+- Sửa đơn đã lưu trong Lịch sử, giữ các lượt nhận món và khoản đã thu hợp lệ; lưu nhật ký thay đổi.
+- Sửa/hủy khoản thanh toán nhập nhầm kèm lý do, tính lại công nợ; chặn số tiền thu vượt phần phải trả.
 - Danh bạ thành viên, biệt danh, phòng ban và thông tin ngân hàng.
 - Một hoặc nhiều người ứng tiền; chia phí giao hàng, tip, voucher và hỗ trợ công ty.
 - Theo dõi thanh toán một phần/toàn bộ và lịch sử thanh toán.
@@ -14,6 +18,8 @@
 - Tự động nâng cấp dữ liệu từ phiên bản cũ khi khởi động.
 
 ## Cài đặt
+
+Với món giảm riêng từ 54.000đ còn 1đ, nhập **Đơn giá = 1**, bật **Chia ưu đãi giá món cho cả đơn** và nhập **Giá gốc = 54.000**. Khi chia theo từng món, người đặt được tính từ giá gốc, còn 53.999đ ưu đãi được phân bổ như khoản giảm giá chung. Voucher của toàn hóa đơn vẫn nhập riêng; tổng tiền thực trả không thay đổi. Nếu nhiều phần có giá khác nhau, hãy tách thành các dòng món riêng.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -40,5 +46,19 @@ Webhook chỉ gửi thông báo khi đã cấu hình URL. Đối soát ngân hà
 ## Kiểm thử
 
 ```powershell
-python -m unittest -v
+python -m unittest discover -v
 ```
+
+Giao diện nền sáng, xanh ngọc, điều hướng bên trái và bố cục mobile được kiểm tra trên Streamlit 1.60. Khởi động lại Streamlit sau khi cập nhật để áp dụng theme mới.
+
+Ứng dụng có hai theme sáng/tối đồng bộ cho form, bảng và biểu đồ. Mở menu ⋮ ở góc trên bên phải, chọn **Light** hoặc **Dark**. Lựa chọn được Streamlit ghi nhớ trong trình duyệt.
+
+Kiểm tra trình duyệt desktop/mobile (320px và 390px):
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m playwright install chromium
+python scripts/check_ui.py
+```
+
+Kiểm thử sử dụng database và cấu hình tạm riêng, không thay đổi dữ liệu thật và không gửi yêu cầu tới AI/Telegram/webhook. Ảnh chụp kiểm tra được lưu trong thư mục tạm; đường dẫn được in khi chạy xong.

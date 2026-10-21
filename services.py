@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
@@ -16,6 +17,22 @@ def parse_money(value):
     return max(0, int(re.sub(r"\D", "", str(value)) or 0))
 
 
+def bill_signature(restaurant, items, total):
+    """Order-independent fingerprint for a bill, excluding editable assignees."""
+    def clean(value):
+        normalized = unicodedata.normalize("NFD", str(value or "").casefold())
+        return " ".join("".join(char for char in normalized if unicodedata.category(char) != "Mn").replace("đ", "d").split())
+
+    quantities = {}
+    for row in items:
+        if int(row.get("unit_price") or 0) <= 0:
+            continue
+        key = (clean(row["item_name"]), int(row["unit_price"]))
+        quantities[key] = quantities.get(key, 0) + int(row["quantity"])
+    lines = tuple(sorted((name, quantity, price) for (name, price), quantity in quantities.items()))
+    return clean(restaurant), lines, int(total)
+
+
 def allocate_items(items, shipping_fee=0, discount=0, tip=0, company_support=0, method="proportional"):
     clean = []
     for raw in items:
@@ -29,11 +46,48 @@ def allocate_items(items, shipping_fee=0, discount=0, tip=0, company_support=0, 
     weights = [1 / len(clean)] * len(clean) if method == "equal" or subtotal == 0 else [x["base"] / subtotal for x in clean]
     shares = [round(net_extra * w) for w in weights]
     shares[-1] += net_extra - sum(shares)
-    for item, share in zip(clean, shares):
-        item["allocated_fee"] = max(0, share)
-        item["allocated_discount"] = max(0, -share)
-        item["amount_due"] = max(0, item["base"] + share)
+    dues = [max(0, item["base"] + share) for item, share in zip(clean, shares)]
+    excess = sum(dues) - max(0, subtotal + net_extra)
+    # A discount can exceed the price of a small item. Transfer the unused
+    # discount to other items so the per-person debts still add up exactly.
+    for index in sorted(range(len(dues)), key=lambda i: dues[i], reverse=True):
+        reduction = min(excess, dues[index])
+        dues[index] -= reduction
+        excess -= reduction
+        if excess == 0:
+            break
+    for item, due in zip(clean, dues):
+        item["allocated_fee"] = max(0, due - item["base"])
+        item["allocated_discount"] = max(0, item["base"] - due)
+        item["amount_due"] = due
     return clean
+
+
+def shared_promo_discount(items):
+    """Savings from struck-through item prices, shared like a bill-wide voucher."""
+    return sum(
+        max(1, int(item.get("quantity", 1)))
+        * max(0, parse_money(item.get("promo_original_price")) - parse_money(item.get("unit_price")))
+        for item in items
+    )
+
+
+def allocate_items_with_shared_promos(items, shipping_fee=0, discount=0, tip=0, company_support=0, method="equal"):
+    """Allocate from original prices while preserving receipt prices in storage."""
+    priced_items = [
+        {**item, "unit_price": max(
+            parse_money(item.get("unit_price")), parse_money(item.get("promo_original_price")),
+        )}
+        for item in items
+    ]
+    allocated = allocate_items(
+        priced_items, shipping_fee, discount + shared_promo_discount(items),
+        tip, company_support, method,
+    )
+    for source, row in zip(items, allocated):
+        row["unit_price"] = parse_money(source.get("unit_price"))
+        row["promo_original_price"] = source.get("promo_original_price")
+    return allocated
 
 
 def person_balances(items, payments, claims=None):

@@ -12,9 +12,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from ui import balance_cards, brand_html, format_datetime, page_header, stylesheet
 
 from database import Database
-from services import allocate_group, allocate_items, backup_zip, excel_report, money, parse_money, person_balances, qr_png, send_telegram, send_webhook
+from services import allocate_group, allocate_items, allocate_items_with_shared_promos, shared_promo_discount, backup_zip, excel_report, money, parse_money, person_balances, qr_png, send_telegram, send_webhook
 
 
 st.set_page_config(page_title="Bill Master", page_icon="🧾", layout="wide")
@@ -33,6 +34,7 @@ IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 db = Database(DB_NAME)
 db.init()
 REQUIRED = " :red[*]"
+st.markdown(f"<style>{stylesheet()}</style>", unsafe_allow_html=True)
 
 
 def authenticate():
@@ -56,35 +58,6 @@ def authenticate():
 
 if not authenticate():
     st.stop()
-
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.5rem; max-width: 1450px}
-    [data-testid="stMetric"] {background:rgba(100,120,255,.08);padding:16px;border-radius:16px;border:1px solid rgba(120,130,255,.18)}
-    div[data-testid="stForm"] {border-radius:18px}
-    .debt-ok {color:#21c55d;font-weight:700}.debt-bad {color:#ff5c75;font-weight:700}
-    div[role="radiogroup"][aria-label="Điều hướng"] {
-        display:flex; gap:8px; flex-wrap:wrap; padding:7px;
-        border-radius:14px; background:rgba(255,255,255,.035);
-        border:1px solid rgba(255,255,255,.08);
-    }
-    div[role="radiogroup"][aria-label="Điều hướng"] label[data-baseweb="radio"] {
-        padding:9px 16px !important; border-radius:10px; margin:0 !important;
-        transition:background .18s ease, color .18s ease, box-shadow .18s ease;
-    }
-    div[role="radiogroup"][aria-label="Điều hướng"] label[data-baseweb="radio"] > div:first-child {display:none !important}
-    div[role="radiogroup"][aria-label="Điều hướng"] label[data-baseweb="radio"]:has(input:checked) {
-        background:linear-gradient(135deg,#667eea,#764ba2);
-        color:white !important; box-shadow:0 5px 14px rgba(102,126,234,.25);
-    }
-    div[role="radiogroup"][aria-label="Điều hướng"] label[data-baseweb="radio"]:hover {background:rgba(255,255,255,.08)}
-    div[role="radiogroup"][aria-label="Điều hướng"] label[data-baseweb="radio"] p {font-weight:600; white-space:nowrap}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 
 def save_image(uploads):
@@ -124,6 +97,14 @@ def money_input(container, label, value=0, key=None, disabled=False):
     return parse_money(raw)
 
 
+def reset_new_bill():
+    """Discard only the current unsaved bill and its uploaded images."""
+    st.session_state.pop("draft", None)
+    st.session_state.pop("scan_signature", None)
+    st.session_state["draft_version"] = st.session_state.get("draft_version", 0) + 1
+    st.session_state["input_version"] = st.session_state.get("input_version", 0) + 1
+
+
 def scan_bill(uploads=None, pasted_text=""):
     api_key = secret("GEMINI_API_KEY")
     if not api_key:
@@ -135,8 +116,10 @@ def scan_bill(uploads=None, pasted_text=""):
     roster = [{"name": member["name"], "aliases": member.get("aliases") or ""} for member in member_options()]
     prompt = """Đọc TOÀN BỘ hóa đơn đặt đồ ăn trong ảnh, từ món đầu tiên đến món cuối cùng. Trả về DUY NHẤT JSON hợp lệ, không markdown:
     {"restaurant":"", "item_count":0, "subtotal":0, "shipping_fee":0, "discount":0, "tip":0, "total":0,
-     "items":[{"person_name":"", "raw_person_note":"", "item_name":"", "quantity":1, "unit_price":0, "confidence":0.0}]}
+     "items":[{"person_name":"", "raw_person_note":"", "item_name":"", "quantity":1, "unit_price":0, "original_unit_price":0, "confidence":0.0}]}
     Giá là số nguyên VND và luôn là số dương; riêng discount cũng trả về trị tuyệt đối dương.
+    unit_price là giá thực tế đang tính trên hóa đơn. Nếu món có giá gốc gạch ngang (ví dụ 54.000đ còn 1đ),
+    ghi giá gạch ngang vào original_unit_price; nếu không có thì trả 0. Không cộng ưu đãi này vào discount của hóa đơn.
     item_count phải đúng với dòng 'Tổng (... món)' nếu nhìn thấy. subtotal là dòng 'Tổng', shipping_fee là 'Phí giao hàng',
     tip gồm 'Phí áp dụng', phí dịch vụ hoặc phụ phí; discount là dòng 'Giảm giá'; total là số cuối cùng thực trả.
     QUY TẮC ĐỌC TÊN TRÊN GRAB: mỗi khối bắt đầu bằng số lượng + tên món + giá. Các dòng xám tiếp theo là size/topping/độ ngọt,
@@ -224,11 +207,53 @@ def payment_dialog(session_id, balance):
     method = st.selectbox("Hình thức", ["Chuyển khoản", "Tiền mặt", "Ví điện tử", "Khác"])
     note = st.text_input("Ghi chú")
     if st.button("Xác nhận đã nhận", type="primary"):
-        if amount <= 0:
-            st.error("Số tiền nhận phải lớn hơn 0.")
+        if amount <= 0 or amount > balance["remaining"]:
+            st.error(f"Số tiền phải từ 1 đến {money(balance['remaining'])}.")
         else:
-            db.add_payment(session_id, balance.get("member_id"), balance["person_name"], amount, method, note)
+            try:
+                db.add_payment(session_id, balance.get("member_id"), balance["person_name"], amount, method, note)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+
+@st.dialog("Sửa khoản thanh toán")
+def edit_payment_dialog(payment):
+    st.caption(f'{payment["person_name"]} · {format_datetime(payment["paid_at"])}')
+    amount = money_input(st, f"Số tiền đã nhận{REQUIRED}", payment["amount"], key=f'edit_payment_amount_{payment["id"]}')
+    methods = ["Chuyển khoản", "Tiền mặt", "Ví điện tử", "Khác", "legacy"]
+    method = st.selectbox("Hình thức", methods,
+                          index=methods.index(payment["method"]) if payment["method"] in methods else 3,
+                          key=f'edit_payment_method_{payment["id"]}')
+    note = st.text_input("Ghi chú", value=payment.get("note") or "", key=f'edit_payment_note_{payment["id"]}')
+    reason = st.text_input(f"Lý do sửa{REQUIRED}", key=f'edit_payment_reason_{payment["id"]}')
+    if st.button("Đóng", key=f'close_edit_payment_{payment["id"]}'):
+        st.session_state.pop("payment_dialog_action", None)
+        st.rerun()
+    if st.button("Lưu khoản thanh toán", type="primary"):
+        try:
+            db.update_payment(payment["id"], amount, method, note, reason)
+            st.session_state.pop("payment_dialog_action", None)
             st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("Hủy khoản thanh toán")
+def delete_payment_dialog(payment):
+    st.warning(f'Bạn muốn hủy khoản {money(payment["amount"])} đã ghi nhận từ {payment["person_name"]}? Công nợ sẽ được tính lại.')
+    reason = st.text_input(f"Lý do hủy{REQUIRED}", key=f'delete_payment_reason_{payment["id"]}')
+    left, right = st.columns(2)
+    if left.button("Giữ lại", use_container_width=True):
+        st.session_state.pop("payment_dialog_action", None)
+        st.rerun()
+    if right.button("Hủy khoản này", type="primary", use_container_width=True):
+        try:
+            db.delete_payment(payment["id"], reason)
+            st.session_state.pop("payment_dialog_action", None)
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
 
 def reminder_text(session, balances):
@@ -277,10 +302,12 @@ def render_shared_claims_modern(session):
                     (claim for claim in shared_claims if claim["item_id"] == item["id"] and claim["member_id"] == claiming_member["id"]),
                     None,
                 )
-                with st.container(border=True):
+                with st.container(border=True, key=f'claim_card_{item["id"]}'):
                     title_col, state_col = st.columns([4, 1])
                     title_col.markdown(f'**{item["item_name"]}**')
                     title_col.caption(f'{money(item["unit_price"])} / phần · {claimed_qty}/{item["quantity"]} đã nhận')
+                    if item.get("promo_original_price") and item["promo_original_price"] > item["unit_price"]:
+                        title_col.caption(f'Giá gốc {money(item["promo_original_price"])} · ưu đãi chia chung cả đơn')
                     if own_claim:
                         state_col.success(f'Bạn đã nhận {int(own_claim["quantity"])}')
                     elif remaining_qty == 0:
@@ -292,8 +319,11 @@ def render_shared_claims_modern(session):
                     if own_claim:
                         control_col.caption("Nếu đổi ý, bạn có thể bỏ nhận món này.")
                         if action_col.button("Bỏ nhận", key=f'unclaim_{item["id"]}_{claiming_member["id"]}', use_container_width=True):
-                            db.remove_claim(item["id"], claiming_member["id"])
-                            st.rerun(scope="fragment")
+                            try:
+                                db.remove_claim(item["id"], claiming_member["id"])
+                                st.rerun(scope="fragment")
+                            except ValueError as exc:
+                                st.error(str(exc))
                     elif remaining_qty > 0:
                         claim_qty = control_col.number_input(
                             "Số lượng nhận", 1, remaining_qty, value=1,
@@ -352,8 +382,11 @@ def render_shared_claims(session):
                 if own_claim:
                     c2.markdown(f'Đã nhận: **{int(own_claim["quantity"])}**')
                     if c3.button("Bỏ nhận", key=f'unclaim_{item["id"]}_{claiming_member["id"]}', use_container_width=True):
-                        db.remove_claim(item["id"], claiming_member["id"])
-                        st.rerun(scope="fragment")
+                        try:
+                            db.remove_claim(item["id"], claiming_member["id"])
+                            st.rerun(scope="fragment")
+                        except ValueError as exc:
+                            st.error(str(exc))
                 elif remaining_qty > 0:
                     claim_qty = c2.number_input("SL nhận", 1, remaining_qty, value=1, key=f'claim_qty_{item["id"]}_{claiming_member["id"]}')
                     if c3.button("Nhận món", key=f'claim_{item["id"]}_{claiming_member["id"]}', use_container_width=True):
@@ -370,15 +403,13 @@ def render_shared_claims(session):
     st.dataframe(pd.DataFrame([{"Người": row["person_name"], "Phải trả": money(row["due"]), "Đã trả": money(row["paid"]), "Còn nợ": money(row["remaining"])} for row in balances]), hide_index=True, use_container_width=True)
 
 
-st.title("🧾 Bill Master")
-st.caption("Quản lý người ứng tiền, chia hóa đơn và công nợ đặt đồ ăn nội bộ")
-
 query_token = st.query_params.get("bill")
 if query_token:
     shared = db.query("SELECT * FROM sessions WHERE share_token=?", (query_token,))
     if shared:
         session = shared[0]
-        st.subheader(f'Đơn được chia sẻ: {session["title"]}')
+        st.markdown(brand_html(), unsafe_allow_html=True)
+        st.markdown(page_header(session["title"], "Cùng nhận món và theo dõi phần thanh toán của mình."), unsafe_allow_html=True)
         render_shared_claims_modern(session)
         if st.button("Đóng chế độ chia sẻ"):
             del st.query_params["bill"]
@@ -390,16 +421,35 @@ if query_token:
 
 
 navigation_options = ["📊 Tổng quan", "➕ Đơn mới", "📚 Lịch sử", "👥 Thành viên", "📈 Báo cáo", "⚙️ Cài đặt"]
-if hasattr(st, "segmented_control"):
-    active_page = st.segmented_control(
-        "Điều hướng", navigation_options, default=navigation_options[0],
-        selection_mode="single", label_visibility="collapsed", key="main_navigation",
-    )
-else:
+with st.sidebar:
+    st.markdown(brand_html(), unsafe_allow_html=True)
     active_page = st.radio(
-        "Điều hướng", navigation_options, horizontal=True,
-        label_visibility="collapsed", key="main_navigation",
+        "Điều hướng", navigation_options, label_visibility="collapsed", key="main_navigation",
     )
+    st.divider()
+    st.caption("☀️ / 🌙 Đổi sáng/tối: menu ⋮ góc trên → Light / Dark.")
+    st.caption("Quét hóa đơn, chia món và theo dõi thanh toán trong cùng một nơi.")
+
+# Streamlit's dialog close (X/Escape) does not run the cancel button callback.
+# Discard the pending edit whenever navigation leaves History, so returning to
+# the page cannot reopen a dialog the user already dismissed.
+if st.session_state.get("previous_page") != active_page:
+    if active_page != "📚 Lịch sử":
+        st.session_state.pop("payment_dialog_action", None)
+        editing_id = st.session_state.pop("editing_session_id", None)
+        if editing_id is not None:
+            st.session_state.pop(f"edit_rows_{editing_id}", None)
+    st.session_state.previous_page = active_page
+
+page_descriptions = {
+    "📊 Tổng quan": "Nắm nhanh chi tiêu chung và phần thanh toán của từng thành viên.",
+    "➕ Đơn mới": "Tải ảnh hóa đơn, kiểm tra thông tin và chia chi phí cho mọi người.",
+    "📚 Lịch sử": "Xem người ứng tiền, cập nhật thanh toán và chia sẻ đơn với nhóm.",
+    "👥 Thành viên": "Quản lý danh bạ và các nhóm thường cùng đặt đồ ăn.",
+    "📈 Báo cáo": "Đối chiếu chi tiêu và công nợ theo khoảng thời gian bạn chọn.",
+    "⚙️ Cài đặt": "Sao lưu dữ liệu và kiểm tra các kết nối của Bill Master.",
+}
+st.markdown(page_header(active_page.split(" ", 1)[1], page_descriptions[active_page]), unsafe_allow_html=True)
 
 if active_page == "📊 Tổng quan":
     sessions, debts = all_debts()
@@ -413,6 +463,10 @@ if active_page == "📊 Tổng quan":
     st.subheader("Công nợ theo thành viên")
     if debts:
         frame = pd.DataFrame(debts).groupby("Người", as_index=False)[["Phải trả", "Đã trả", "Còn nợ"]].sum().sort_values("Còn nợ", ascending=False)
+        st.markdown(balance_cards([
+            {"person_name": row["Người"], "remaining": row["Còn nợ"]}
+            for row in frame.to_dict("records")
+        ]), unsafe_allow_html=True)
         frame_display = frame.copy()
         for column in ["Phải trả", "Đã trả", "Còn nợ"]:
             frame_display[column] = frame_display[column].map(money)
@@ -431,7 +485,7 @@ if active_page == "📊 Tổng quan":
                     "Trạng thái:N",
                     scale=alt.Scale(
                         domain=["Đã trả", "Còn nợ"],
-                        range=["#605eea", "#ff6b81"],
+                        range=["#149c87", "#d5533e"],
                     ),
                     legend=alt.Legend(title=None),
                 ),
@@ -455,7 +509,11 @@ if active_page == "➕ Đơn mới":
     )
     if upload:
         st.image(upload, width=250)
-    if st.button("✨ Đọc hóa đơn bằng AI", disabled=not upload):
+    scan_column, reset_column = st.columns([3, 1], vertical_alignment="bottom")
+    if reset_column.button("↺ Làm lại", key="reset_new_bill", help="Xóa ảnh và thông tin đơn đang nhập; không ảnh hưởng các đơn đã lưu.", use_container_width=True):
+        reset_new_bill()
+        st.rerun()
+    if scan_column.button("✨ Đọc hóa đơn bằng AI", disabled=not upload, use_container_width=True):
         with st.spinner("Đang hợp nhất và phân tích hóa đơn..."):
             try:
                 st.session_state.draft = scan_bill(upload)
@@ -470,15 +528,16 @@ if active_page == "➕ Đơn mới":
     names = ["Chưa xác định"] + [x["name"] for x in members]
     name_to_member = {x["name"]: x for x in members}
     st.subheader("2. Kiểm tra thông tin")
-    with st.container(border=True):
+    with st.container(border=True, key="bill_editor"):
         a, b, c = st.columns(3)
-        title = a.text_input(f"Tên đơn{REQUIRED}", value=f"Đồ ăn ngày {datetime.now():%d/%m}")
-        restaurant = b.text_input("Quán", value=draft.get("restaurant", ""))
-        payer_name = c.selectbox(f"Người ứng tiền{REQUIRED}", names, format_func=name_search_label)
+        title = a.text_input(f"Tên đơn{REQUIRED}", value=f"Đồ ăn ngày {datetime.now():%d/%m}", key=f"new_bill_title_{draft_version}")
+        restaurant = b.text_input("Quán", value=draft.get("restaurant", ""), key=f"new_bill_restaurant_{draft_version}")
+        payer_name = c.selectbox(f"Người ứng tiền{REQUIRED}", names, format_func=name_search_label, key=f"new_bill_payer_{draft_version}")
         debt_mode = st.radio(
             "Cách tính công nợ",
             ["Theo từng món", "Chia đều cho nhóm", "Nhập số tiền từng người"],
             horizontal=True,
+            key=f"new_bill_debt_mode_{draft_version}",
             help="Chi phí chung dùng cho sinh nhật, liên hoan hoặc các khoản không tính theo món của từng người.",
         )
         st.markdown("**Các món**")
@@ -490,6 +549,7 @@ if active_page == "➕ Đơn mới":
             item.setdefault("_row_id", uuid.uuid4().hex)
         raw_items = []
         allocation_errors = []
+        promo_errors = []
         review_issues = []
         entered_item_count = 0
         for i, item in enumerate(initial_items):
@@ -508,6 +568,22 @@ if active_page == "➕ Đơn mới":
             item_name = cols[1].text_input(f"Món{REQUIRED}", value=item.get("item_name", ""), key=f"dish_{row_id}")
             quantity = cols[2].number_input(f"SL{REQUIRED}", 1, 50, value=max(1, int(item.get("quantity", 1))), key=f"qty_{row_id}")
             unit_price = money_input(cols[3], f"Đơn giá{REQUIRED}", parse_money(item.get("unit_price", 0)), key=f"price_{row_id}")
+            promo_key = f"promo_{row_id}"
+            show_promo = (unit_price == 1 or
+                          parse_money(item.get("original_unit_price")) > parse_money(item.get("unit_price")) or
+                          bool(st.session_state.get(promo_key)))
+            has_promo = st.checkbox(
+                "🎁 Chia ưu đãi giá món cho cả đơn", key=f"promo_{row_id}",
+                value=parse_money(item.get("original_unit_price")) > parse_money(item.get("unit_price")),
+                help="Ví dụ món trên hóa đơn 1đ, giá gốc 54.000đ: người đặt được tính từ giá gốc, phần giảm 53.999đ chia chung cho cả đơn.",
+            ) if show_promo else False
+            promo_original_price = (money_input(
+                st, f"Giá gốc trước ưu đãi{REQUIRED}", parse_money(item.get("original_unit_price")),
+                key=f"promo_original_{row_id}",
+            ) if has_promo else None)
+            if has_promo and promo_original_price <= unit_price:
+                promo_errors.append(f"{item_name or 'Món chưa đặt tên'}: giá gốc phải lớn hơn giá trên hóa đơn.")
+            promo_fields = {"promo_original_price": promo_original_price}
             if cols[4].button("🗑️", key=f"remove_{row_id}", help="Bỏ món này", use_container_width=True):
                 draft["items"] = [row for row in initial_items if row["_row_id"] != row_id]
                 if not draft["items"]:
@@ -522,10 +598,10 @@ if active_page == "➕ Đơn mới":
             if item_name.strip():
                 entered_item_count += 1
                 if debt_mode != "Theo từng món":
-                    raw_items.append({"member_id": None, "person_name": "Chưa xác định", "item_name": item_name.strip(), "quantity": quantity, "unit_price": unit_price, "ai_confidence": item_confidence})
+                    raw_items.append({"member_id": None, "person_name": "Chưa xác định", "item_name": item_name.strip(), "quantity": quantity, "unit_price": unit_price, "ai_confidence": item_confidence, **promo_fields})
                 elif quantity == 1:
                     member = name_to_member.get(person)
-                    raw_items.append({"member_id": member["id"] if member else None, "person_name": person, "item_name": item_name.strip(), "quantity": 1, "unit_price": unit_price, "ai_confidence": item_confidence})
+                    raw_items.append({"member_id": member["id"] if member else None, "person_name": person, "item_name": item_name.strip(), "quantity": 1, "unit_price": unit_price, "ai_confidence": item_confidence, **promo_fields})
                 else:
                     allocation_mode = st.radio(
                         f"Phân bổ {quantity} × {item_name}",
@@ -535,7 +611,7 @@ if active_page == "➕ Đơn mới":
                     )
                     if allocation_mode == "Một người đặt tất cả":
                         member = name_to_member.get(person)
-                        raw_items.append({"member_id": member["id"] if member else None, "person_name": person, "item_name": item_name.strip(), "quantity": quantity, "unit_price": unit_price, "ai_confidence": item_confidence})
+                        raw_items.append({"member_id": member["id"] if member else None, "person_name": person, "item_name": item_name.strip(), "quantity": quantity, "unit_price": unit_price, "ai_confidence": item_confidence, **promo_fields})
                     else:
                         assignee_count = st.number_input(
                             f"Số người nhận món{REQUIRED}", 2, int(quantity), value=min(2, int(quantity)),
@@ -559,7 +635,7 @@ if active_page == "➕ Đơn mới":
                             if split_person == "Chưa xác định":
                                 allocation_errors.append(f"{item_name}: chưa chọn người nhận phần {j + 1}")
                             member = name_to_member.get(split_person)
-                            raw_items.append({"member_id": member["id"] if member else None, "person_name": split_person, "item_name": item_name.strip(), "quantity": int(split_qty), "unit_price": unit_price, "ai_confidence": item_confidence})
+                            raw_items.append({"member_id": member["id"] if member else None, "person_name": split_person, "item_name": item_name.strip(), "quantity": int(split_qty), "unit_price": unit_price, "ai_confidence": item_confidence, **promo_fields})
                         if allocated_total != int(quantity):
                             allocation_errors.append(f"{item_name}: đã phân {allocated_total}/{quantity} phần")
                         else:
@@ -573,6 +649,9 @@ if active_page == "➕ Đơn mới":
         shipping = money_input(f1, "Phí giao hàng", parse_money(draft.get("shipping_fee", 0)), key=f"shipping_{draft_version}")
         discount = money_input(f2, "Voucher/giảm giá", parse_money(draft.get("discount", 0)), key=f"discount_{draft_version}")
         tip = money_input(f3, "Tip/phụ phí", parse_money(draft.get("tip", 0)), key=f"tip_{draft_version}")
+        promo_total = shared_promo_discount(raw_items)
+        if promo_total:
+            st.caption(f"🎁 Ưu đãi giá món chia chung: {money(promo_total)} · giữ nguyên số tiền thực trả trên hóa đơn.")
         with st.expander("Tùy chọn: công ty hỗ trợ một phần"):
             support = money_input(st, "Số tiền công ty hỗ trợ", 0, key=f"support_{draft_version}")
         group_participants = []
@@ -581,13 +660,14 @@ if active_page == "➕ Đơn mới":
         if debt_mode != "Theo từng món":
             st.markdown("**Nhóm cùng đóng góp**")
             templates = db.query("SELECT * FROM group_templates ORDER BY name")
-            template = st.selectbox("Mẫu nhóm", [None] + templates, format_func=lambda row: "Không dùng mẫu" if row is None else row["name"])
+            template = st.selectbox("Mẫu nhóm", [None] + templates, format_func=lambda row: "Không dùng mẫu" if row is None else row["name"], key=f"new_bill_template_{draft_version}")
             template_ids = {int(value) for value in template["member_ids"].split(",") if value} if template else set()
             member_by_id = {member["id"]: member for member in members}
             default_group_ids = [member["id"] for member in members if member["id"] in template_ids]
             g1, g2 = st.columns([1, 2])
             honoree_id = g1.selectbox(
                 "Người được tổ chức/miễn đóng", [None] + list(member_by_id),
+                key=f"new_bill_honoree_{draft_version}",
                 format_func=lambda member_id: "Không có" if member_id is None else f'{member_by_id[member_id]["name"]} · {db.normalize_name(member_by_id[member_id]["name"])}',
             )
             selected_ids = g2.multiselect(
@@ -638,7 +718,19 @@ if active_page == "➕ Đơn mới":
             st.warning("Cần kiểm tra kết quả quét trước khi lưu:\n\n" + "\n".join(f"- {issue}" for issue in review_issues))
             review_key = f'bill_review_ack_{draft_version}_{abs(hash(tuple(review_issues)))}'
             review_confirmed = st.checkbox("Tôi đã kiểm tra các cảnh báo và xác nhận số liệu trước khi lưu", key=review_key)
-        submitted = st.button("Tính và lưu đơn", type="primary", use_container_width=True, disabled=not review_confirmed)
+        possible_duplicates = db.find_possible_duplicates(
+            restaurant, raw_items, max(0, line_subtotal + shipping + tip - discount - support)
+        )
+        duplicate_confirmed = True
+        if possible_duplicates:
+            duplicate_labels = ", ".join(f'#{row["id"]} {row["title"]}' for row in possible_duplicates[:3])
+            st.warning(f"Đơn này có thể đã được lưu: {duplicate_labels}. Kiểm tra Lịch sử trước khi tạo thêm.")
+            duplicate_confirmed = st.checkbox(
+                "Tôi đã kiểm tra và vẫn muốn lưu đơn mới",
+                key=f'duplicate_ack_{draft_version}_{"_".join(str(row["id"]) for row in possible_duplicates)}',
+            )
+        submitted = st.button("Tính và lưu đơn", type="primary", use_container_width=True,
+                              disabled=not review_confirmed or not duplicate_confirmed)
     if submitted:
         if not title.strip():
             st.error("Tên đơn là thông tin bắt buộc.")
@@ -646,6 +738,8 @@ if active_page == "➕ Đơn mới":
             st.error("Cần ít nhất một món hợp lệ.")
         elif any(item["unit_price"] <= 0 for item in raw_items):
             st.error("Đơn giá của tất cả món phải lớn hơn 0.")
+        elif promo_errors:
+            st.error("Không thể chia ưu đãi:\n- " + "\n- ".join(promo_errors))
         elif allocation_errors:
             st.error("Không thể lưu vì tổng số lượng phân bổ chưa khớp:\n- " + "\n- ".join(allocation_errors))
         elif debt_mode != "Theo từng món" and not group_participants:
@@ -659,7 +753,7 @@ if active_page == "➕ Đơn mới":
             subtotal = sum(x["quantity"] * x["unit_price"] for x in raw_items)
             expected = max(0, subtotal + shipping + tip - discount - support)
             if debt_mode == "Theo từng món":
-                calculated = allocate_items(raw_items, shipping, discount, tip, support, method)
+                calculated = allocate_items_with_shared_promos(raw_items, shipping, discount, tip, support, method)
             else:
                 # Giữ các dòng món để đối chiếu nhưng công nợ đến từ nhóm đóng góp.
                 source_items = allocate_items(raw_items)
@@ -672,13 +766,168 @@ if active_page == "➕ Đơn mới":
             advances = [{"member_id": payer["id"], "person_name": payer_name, "amount": expected}]
             data = {"title": title.strip(), "restaurant": restaurant.strip(), "payer_member_id": payer["id"], "subtotal": subtotal, "shipping_fee": shipping, "discount": discount, "tip": tip, "company_support": support, "allocation_method": method, "payment_method": "Chuyển khoản", "notes": ""}
             session_id = db.create_session(data, calculated, advances, save_image(upload))
-            st.session_state.pop("draft", None)
-            st.session_state.pop("scan_signature", None)
-            st.session_state.draft_version = draft_version + 1
-            st.session_state.input_version = input_version + 1
+            reset_new_bill()
             st.session_state.bill_saved_message = True
             st.session_state.bill_saved_message_text = f"Đã lưu đơn #{session_id}, tổng cần thu {money(expected)}. Tổng quan đã được cập nhật."
             st.rerun()
+
+@st.dialog("Sửa đơn hàng", width="large")
+def edit_session_dialog(session):
+    current_items = db.query("SELECT * FROM items WHERE session_id=? ORDER BY id", (session["id"],))
+    group_mode = session["allocation_method"] in {"group_equal", "group_custom"}
+    contribution_name = "Phần đóng góp chi phí chung"
+    contribution_rows = [row for row in current_items if group_mode and row["item_name"] == contribution_name]
+    source_rows = [row for row in current_items if row not in contribution_rows]
+    missing_source_prices = group_mode and any(row["unit_price"] == 0 for row in source_rows)
+    claimed_ids = {claim["item_id"] for claim in db.query(
+        "SELECT c.item_id FROM item_claims c JOIN items i ON i.id=c.item_id WHERE i.session_id=?",
+        (session["id"],),
+    )}
+    state_key = f'edit_rows_{session["id"]}'
+    if state_key not in st.session_state:
+        st.session_state[state_key] = [dict(row) for row in source_rows]
+    rows = st.session_state[state_key]
+    members = member_options(False)
+    member_by_id = {member["id"]: member for member in members}
+    member_ids = list(member_by_id)
+    st.caption(f'Đơn #{session["id"]} · Các khoản đã thu vẫn được giữ lại.')
+    title = st.text_input(f"Tên đơn{REQUIRED}", value=session["title"], key=f'edit_title_{session["id"]}')
+    restaurant = st.text_input("Quán", value=session.get("restaurant") or "", key=f'edit_restaurant_{session["id"]}')
+    payer_id = st.selectbox(
+        f"Người ứng tiền{REQUIRED}", member_ids,
+        index=member_ids.index(session["payer_member_id"]) if session["payer_member_id"] in member_ids else 0,
+        format_func=lambda member_id: member_by_id[member_id]["name"],
+        key=f'edit_payer_{session["id"]}',
+    )
+    st.markdown("**Các món trong hóa đơn**")
+    if missing_source_prices:
+        st.warning("Đơn giá từng món của đơn cũ đã bị mất. Tổng tiền đơn vẫn được giữ. Bạn có thể sửa thông tin đơn; nếu muốn sửa giá hoặc số lượng, hãy nhập lại đầy đủ đơn giá từ hóa đơn gốc.")
+    edited_rows = []
+    promo_errors = []
+    for index, row in enumerate(rows):
+        row_key = row.get("_row_id") or str(row.get("id") or uuid.uuid4().hex)
+        row["_row_id"] = row_key
+        with st.container(border=True):
+            a, b, c, d = st.columns([3, 1, 2, 1], vertical_alignment="bottom")
+            item_name = a.text_input(f"Món {index + 1}{REQUIRED}", value=row["item_name"], key=f'edit_dish_{session["id"]}_{row_key}')
+            quantity = b.number_input("SL", min_value=1, max_value=50, value=int(row["quantity"]),
+                                      key=f'edit_qty_{session["id"]}_{row_key}')
+            unit_price = money_input(c, "Đơn giá", row["unit_price"], key=f'edit_price_{session["id"]}_{row_key}')
+            promo_key = f'edit_promo_{session["id"]}_{row_key}'
+            show_promo = (unit_price == 1 or
+                          bool(row.get("promo_original_price") and row["promo_original_price"] > row["unit_price"]) or
+                          bool(st.session_state.get(promo_key)))
+            has_promo = st.checkbox(
+                "🎁 Chia ưu đãi giá món cho cả đơn",
+                value=bool(row.get("promo_original_price") and row["promo_original_price"] > row["unit_price"]),
+                key=promo_key,
+            ) if show_promo else False
+            promo_original_price = (money_input(
+                st, "Giá gốc trước ưu đãi", row.get("promo_original_price") or 0,
+                key=f'edit_promo_original_{session["id"]}_{row_key}',
+            ) if has_promo else None)
+            if has_promo and promo_original_price <= unit_price:
+                promo_errors.append(f"{item_name or 'Món chưa đặt tên'}: giá gốc phải lớn hơn giá trên hóa đơn.")
+            if d.button("🗑️", key=f'edit_remove_{session["id"]}_{row_key}',
+                        help="Món đã có người nhận cần được bỏ nhận trước." if row.get("id") in claimed_ids else "Bỏ món",
+                        disabled=row.get("id") in claimed_ids):
+                rows.pop(index)
+                st.rerun(scope="fragment")
+            member_id = None
+            person_name = "Chưa xác định"
+            if not group_mode:
+                options = [None] + member_ids
+                member_id = st.selectbox(
+                    "Người đặt", options, index=options.index(row.get("member_id")) if row.get("member_id") in options else 0,
+                    format_func=lambda value: "Chưa xác định" if value is None else member_by_id[value]["name"],
+                    key=f'edit_person_{session["id"]}_{row_key}',
+                )
+                person_name = member_by_id[member_id]["name"] if member_id is not None else "Chưa xác định"
+                if row.get("id") in claimed_ids:
+                    st.caption("Món đã có người nhận: giữ người đặt là 'Chưa xác định', hoặc bỏ nhận trước khi gán lại.")
+            edited_rows.append({**row, "member_id": member_id, "person_name": person_name,
+                                "item_name": item_name.strip(), "quantity": int(quantity), "unit_price": unit_price,
+                                "promo_original_price": promo_original_price})
+    if st.button("＋ Thêm món", key=f'edit_add_{session["id"]}'):
+        rows[:] = edited_rows
+        rows.append({"_row_id": uuid.uuid4().hex, "member_id": None, "person_name": "Chưa xác định",
+                     "item_name": "", "quantity": 1, "unit_price": 0})
+        st.rerun(scope="fragment")
+    rows[:] = edited_rows
+    x, y, z = st.columns(3)
+    shipping = money_input(x, "Phí giao hàng", session["shipping_fee"], key=f'edit_shipping_{session["id"]}')
+    discount = money_input(y, "Voucher/giảm giá", session["discount"], key=f'edit_discount_{session["id"]}')
+    tip = money_input(z, "Tip/phụ phí", session["tip"], key=f'edit_tip_{session["id"]}')
+    support = money_input(st, "Công ty hỗ trợ", session["company_support"], key=f'edit_support_{session["id"]}')
+    prices_incomplete = group_mode and any(row["unit_price"] <= 0 for row in edited_rows)
+    source_structure_changed = len(edited_rows) != len(source_rows) or any(
+        row.get("id") != original["id"] or row["quantity"] != original["quantity"]
+        or row["unit_price"] != original["unit_price"]
+        or row.get("promo_original_price") != original.get("promo_original_price")
+        for row, original in zip(edited_rows, source_rows)
+    )
+    subtotal = (session["subtotal"] if missing_source_prices and prices_incomplete
+                else sum(row["quantity"] * row["unit_price"] for row in edited_rows))
+    total = max(0, subtotal + shipping + tip - discount - support)
+    promo_total = shared_promo_discount(edited_rows)
+    if promo_total:
+        st.caption(f"🎁 Ưu đãi giá món chia chung: {money(promo_total)}")
+    st.caption(f"Tổng mới: {money(total)}")
+    custom_amounts = {}
+    if group_mode:
+        st.markdown("**Người cùng đóng**")
+        for group_row in contribution_rows:
+            if session["allocation_method"] == "group_custom":
+                custom_amounts[group_row["member_id"]] = money_input(
+                    st, group_row["person_name"], group_row["amount_due"],
+                    key=f'edit_group_amount_{session["id"]}_{group_row["id"]}',
+                )
+            else:
+                st.caption(group_row["person_name"])
+    cancel_col, save_col = st.columns(2)
+    if cancel_col.button("Hủy chỉnh sửa", use_container_width=True):
+        st.session_state.pop(state_key, None)
+        st.session_state.pop("editing_session_id", None)
+        st.rerun()
+    if save_col.button("Lưu thay đổi đơn", type="primary", use_container_width=True):
+        if not title.strip() or not edited_rows or any(not row["item_name"] for row in edited_rows) or (not group_mode and any(row["unit_price"] <= 0 for row in edited_rows)):
+            st.error("Cần tên đơn và ít nhất một món có tên, đơn giá hợp lệ.")
+        elif promo_errors:
+            st.error("Không thể chia ưu đãi:\n- " + "\n- ".join(promo_errors))
+        elif missing_source_prices and prices_incomplete and source_structure_changed:
+            st.error("Cần nhập lại đầy đủ đơn giá trước khi đổi giá, số lượng, thêm hoặc xóa món trong đơn cũ.")
+        elif group_mode and prices_incomplete and not missing_source_prices:
+            st.error("Cần nhập đơn giá hợp lệ cho tất cả món.")
+        elif group_mode and not contribution_rows:
+            st.error("Đơn nhóm chưa có người cùng đóng.")
+        elif group_mode and session["allocation_method"] == "group_custom" and sum(custom_amounts.values()) != total:
+            st.error(f"Tổng tiền từng người phải đúng {money(total)}.")
+        else:
+            if group_mode:
+                calculated = [{**row, "allocated_fee": 0, "allocated_discount": 0, "amount_due": 0}
+                              for row in edited_rows]
+                if session["allocation_method"] == "group_equal":
+                    participants = [member_by_id[row["member_id"]] for row in contribution_rows]
+                    amounts = allocate_group(participants, total)
+                    calculated.extend({**row, "amount_due": amount["amount_due"], "unit_price": amount["unit_price"]}
+                                      for row, amount in zip(contribution_rows, amounts))
+                else:
+                    calculated.extend({**row, "amount_due": custom_amounts[row["member_id"]],
+                                       "unit_price": custom_amounts[row["member_id"]]}
+                                      for row in contribution_rows)
+            else:
+                calculated = allocate_items_with_shared_promos(edited_rows, shipping, discount, tip, support, method="equal")
+            data = {"title": title.strip(), "restaurant": restaurant.strip(), "payer_member_id": payer_id,
+                    "subtotal": subtotal, "shipping_fee": shipping, "discount": discount, "tip": tip,
+                    "company_support": support, "allocation_method": session["allocation_method"]}
+            try:
+                db.update_session(session["id"], session["revision"], data, calculated)
+                st.session_state.pop(state_key, None)
+                st.session_state.pop("editing_session_id", None)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
 
 @st.fragment(run_every="5s")
 def render_history():
@@ -687,34 +936,73 @@ def render_history():
     keyword = h1.text_input("Tìm tên đơn, quán hoặc thành viên")
     status_filter = h2.selectbox("Trạng thái", ["Tất cả", "Chưa thu đủ", "Đã thu đủ"])
     payer_filter = h3.selectbox("Người ứng", ["Tất cả"] + [m["name"] for m in member_options()], format_func=name_search_label)
-    sessions = db.query("""SELECT s.*,m.name payer_name,m.bank_name payer_bank_name,m.bank_account payer_bank_account
-                            FROM sessions s LEFT JOIN members m ON m.id=s.payer_member_id ORDER BY s.id DESC""")
+    filters = (db.normalize_name(keyword), status_filter, payer_filter)
+    if st.session_state.get("history_filters") != filters:
+        st.session_state.history_filters = filters
+        st.session_state.history_page = 1
+    page = max(1, int(st.session_state.get("history_page", 1)))
+    total_count, sessions = db.history_page(keyword, status_filter, payer_filter, page)
+    total_pages = max(1, (total_count + 9) // 10)
+    if page > total_pages:
+        page = total_pages
+        st.session_state.history_page = page
+        total_count, sessions = db.history_page(keyword, status_filter, payer_filter, page)
+    results = st.container(key="history_results")
+    if not sessions:
+        results.info("Không có đơn phù hợp bộ lọc.")
+    visible_ids = [session["id"] for session in sessions]
+    items_by_session = {session_id: [] for session_id in visible_ids}
+    payments_by_session = {session_id: [] for session_id in visible_ids}
+    claims_by_session = {session_id: [] for session_id in visible_ids}
+    changes_by_session = {session_id: [] for session_id in visible_ids}
+    payment_changes_by_session = {session_id: [] for session_id in visible_ids}
+    if visible_ids:
+        placeholders = ",".join("?" for _ in visible_ids)
+        for item in db.query(f"SELECT * FROM items WHERE session_id IN ({placeholders}) ORDER BY id", visible_ids):
+            items_by_session[item["session_id"]].append(item)
+        for payment in db.query(
+            f"SELECT * FROM payments WHERE session_id IN ({placeholders}) ORDER BY paid_at DESC, id DESC", visible_ids,
+        ):
+            payments_by_session[payment["session_id"]].append(payment)
+        for claim in db.query(
+            "SELECT c.*,m.name person_name,i.session_id FROM item_claims c "
+            "JOIN members m ON m.id=c.member_id JOIN items i ON i.id=c.item_id "
+            f"WHERE i.session_id IN ({placeholders})", visible_ids,
+        ):
+            claims_by_session[claim["session_id"]].append(claim)
+        for change in db.query(
+            "SELECT entity_id,detail,created_at FROM audit_log WHERE entity_type='session' "
+            f"AND action='edit' AND entity_id IN ({placeholders}) ORDER BY id DESC", visible_ids,
+        ):
+            changes_by_session[change["entity_id"]].append(change)
+        for change in db.query(
+            "SELECT detail,created_at FROM audit_log WHERE entity_type='payment' "
+            f"AND CASE WHEN json_valid(detail) THEN json_extract(detail, '$.before.session_id') END IN ({placeholders}) "
+            "ORDER BY id DESC", visible_ids,
+        ):
+            detail = json.loads(change["detail"])
+            session_id = detail.get("before", {}).get("session_id")
+            if session_id in payment_changes_by_session:
+                payment_changes_by_session[session_id].append((change, detail))
     for session in sessions:
-        items = db.query("SELECT * FROM items WHERE session_id=?", (session["id"],))
-        payments = db.query("SELECT * FROM payments WHERE session_id=? ORDER BY paid_at DESC", (session["id"],))
-        claims = db.query("""SELECT c.*,m.name person_name FROM item_claims c JOIN members m ON m.id=c.member_id
-                              JOIN items i ON i.id=c.item_id WHERE i.session_id=?""", (session["id"],))
+        items = items_by_session[session["id"]]
+        payments = payments_by_session[session["id"]]
+        claims = claims_by_session[session["id"]]
         balances = person_balances(items, payments, claims)
-        searchable = db.normalize_name(" ".join([session["title"], session.get("restaurant") or "", *(x["person_name"] for x in balances)]))
-        if keyword and db.normalize_name(keyword) not in searchable:
-            continue
-        if payer_filter != "Tất cả" and session.get("payer_name") != payer_filter:
-            continue
         session["bank_name"] = session.pop("payer_bank_name", "")
         session["bank_account"] = session.pop("payer_bank_account", "")
         remaining = sum(x["remaining"] for x in balances)
-        if status_filter == "Chưa thu đủ" and remaining == 0:
-            continue
-        if status_filter == "Đã thu đủ" and remaining > 0:
-            continue
         label = f'{"✅" if remaining == 0 else "⏳"} #{session["id"]} · {session["title"]} · còn {money(remaining)}'
-        with st.expander(label, expanded=remaining > 0):
+        with results.expander(label, expanded=remaining > 0):
             st.caption(f'{session["date"]} · {session.get("restaurant") or "Không rõ quán"} · Người ứng: {session.get("payer_name") or "Chưa xác định"}')
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Tiền món", money(session["subtotal"]))
             m2.metric("Phí + tip", money(session["shipping_fee"] + session["tip"]))
             m3.metric("Giảm + hỗ trợ", money(session["discount"] + session["company_support"]))
             m4.metric("Còn thu", money(remaining))
+            promo_savings = shared_promo_discount(items)
+            if promo_savings:
+                st.caption(f"🎁 Ưu đãi giá món {money(promo_savings)} đã được chia chung khi tính công nợ; tổng thanh toán vẫn theo hóa đơn.")
             table = pd.DataFrame([{"Người": x["person_name"], "Phải trả": money(x["due"]), "Đã trả": money(x["paid"]), "Còn nợ": money(x["remaining"])} for x in balances])
             st.dataframe(table, hide_index=True, use_container_width=True)
             cols = st.columns(min(4, max(1, len(balances))))
@@ -742,7 +1030,8 @@ def render_history():
                     st.warning("Link localhost chỉ mở được trên máy của bạn. Muốn đồng nghiệp truy cập, hãy dùng địa chỉ IP mạng nội bộ hoặc triển khai ứng dụng lên Internet.")
             else:
                 st.warning("Chưa cấu hình APP_BASE_URL nên chưa tạo được link đầy đủ. Xem hướng dẫn trong tab Cài đặt.")
-            with st.popover("📨 Nhắc thanh toán / gửi Teams"):
+            actions = st.container(horizontal=True, vertical_alignment="center", gap="small")
+            with actions.popover("📨 Nhắc thanh toán"):
                 text = reminder_text(session, balances)
                 text_with_link = text + (f"\n\nTự nhận món/xem công nợ: {share_url}" if share_url else "")
                 st.text_area("Nội dung", text_with_link, height=180, key=f"reminder_{session['id']}")
@@ -750,7 +1039,7 @@ def render_history():
                 latest_reminder = reminder_logs[0] if reminder_logs else None
                 recent_reminder = False
                 if latest_reminder:
-                    st.caption(f'Đã nhắc {latest_reminder["recipient_count"]} người · {latest_reminder["channel"]} · {latest_reminder["sent_at"]}')
+                    st.caption(f'Đã nhắc {latest_reminder["recipient_count"]} người · {latest_reminder["channel"]} · {format_datetime(latest_reminder["sent_at"])}')
                     try:
                         elapsed = (datetime.now() - datetime.fromisoformat(latest_reminder["sent_at"])).total_seconds()
                         recent_reminder = elapsed < 30 * 60
@@ -774,24 +1063,39 @@ def render_history():
                 telegram_chat_id = secret("TELEGRAM_CHAT_ID")
                 unpaid_count = sum(1 for balance in balances if balance["remaining"] > 0)
                 action_cols = st.columns(3)
-                if action_cols[0].button("Đã gửi nhắc thủ công", key=f'manual_reminder_{session["id"]}', disabled=not unpaid_count or not allow_repeat, use_container_width=True):
+                with action_cols[0].container(border=True):
+                    st.caption("Đã nhắc qua kênh khác")
+                    manual_clicked = st.button("✓ Ghi nhận đã nhắc", key=f'manual_reminder_{session["id"]}',
+                                               help="Chỉ lưu lịch sử; không gửi tin nhắn.",
+                                               disabled=not unpaid_count or not allow_repeat, use_container_width=True)
+                if manual_clicked:
                     db.log_reminder(session["id"], "Thủ công", unpaid_count, text_with_link)
                     st.success("Đã lưu lịch sử nhắc nợ.")
-                    st.rerun(scope="fragment")
-                if action_cols[1].button("Gửi Telegram", key=f"telegram_{session['id']}", disabled=not telegram_token or not telegram_chat_id or not unpaid_count or not allow_repeat, use_container_width=True):
+                    st.rerun()
+                with action_cols[1].container(border=True):
+                    st.caption("Gửi qua bot Telegram")
+                    telegram_clicked = st.button("✈️ Gửi Telegram", key=f"telegram_{session['id']}", type="primary",
+                                                 disabled=not telegram_token or not telegram_chat_id or not unpaid_count or not allow_repeat,
+                                                 use_container_width=True)
+                if telegram_clicked:
                     try:
                         if send_telegram(telegram_token, telegram_chat_id, text_with_link):
                             db.log_reminder(session["id"], "Telegram", unpaid_count, text_with_link)
                             st.success("Đã gửi Telegram và lưu lịch sử nhắc nợ.")
-                            st.rerun(scope="fragment")
+                            st.rerun()
                     except Exception as exc:
                         st.error(f"Gửi Telegram thất bại: {exc}")
-                if action_cols[2].button("Gửi webhook", key=f"hook_{session['id']}", disabled=not webhook or not unpaid_count or not allow_repeat, use_container_width=True):
+                with action_cols[2].container(border=True):
+                    st.caption("Gửi qua Slack / Teams")
+                    webhook_clicked = st.button("↗ Gửi webhook", key=f"hook_{session['id']}", type="primary",
+                                                disabled=not webhook or not unpaid_count or not allow_repeat,
+                                                use_container_width=True)
+                if webhook_clicked:
                     try:
                         if send_webhook(webhook, text_with_link):
                             db.log_reminder(session["id"], "Webhook", unpaid_count, text_with_link)
                             st.success("Đã gửi và lưu lịch sử nhắc nợ.")
-                            st.rerun(scope="fragment")
+                            st.rerun()
                         else:
                             st.error("Dịch vụ từ chối yêu cầu.")
                     except Exception as exc:
@@ -803,18 +1107,94 @@ def render_history():
                 if reminder_logs:
                     with st.expander(f"Lịch sử nhắc ({len(reminder_logs)} lần)"):
                         for reminder in reminder_logs:
-                            st.caption(f'{reminder["sent_at"]} · {reminder["channel"]} · {reminder["recipient_count"]} người')
+                            st.caption(f'{format_datetime(reminder["sent_at"])} · {reminder["channel"]} · {reminder["recipient_count"]} người')
             if session.get("image_path") and Path(session["image_path"]).exists():
-                with st.popover("🖼️ Ảnh gốc"):
+                with actions.popover("🖼️ Ảnh gốc"):
                     st.image(session["image_path"], use_container_width=True)
             if payments:
-                with st.popover("Lịch sử thanh toán"):
-                    st.dataframe(pd.DataFrame(payments)[["person_name", "amount", "method", "note", "paid_at"]], hide_index=True)
-            if st.button("🗑️ Xóa đơn", key=f"delete_{session['id']}"):
+                with st.expander("Lịch sử thanh toán"):
+                    payment_table = pd.DataFrame([
+                        {"Người": payment["person_name"], "Số tiền": money(payment["amount"]),
+                         "Hình thức": payment["method"], "Ghi chú": payment["note"],
+                         "Ngày trả": format_datetime(payment["paid_at"])}
+                        for payment in payments
+                    ])
+                    selected = st.dataframe(
+                        payment_table, hide_index=True, use_container_width=True,
+                        on_select="rerun", selection_mode="single-row",
+                        key=f'payment_history_{session["id"]}',
+                    )
+                    selected_rows = selected.selection.rows
+                    selected_key = f'selected_payment_{session["id"]}'
+                    if selected_rows and selected_rows[0] < len(payments):
+                        st.session_state[selected_key] = payments[selected_rows[0]]["id"]
+                    payment = next((row for row in payments if row["id"] == st.session_state.get(selected_key)), None)
+                    if payment:
+                        if payment["method"] == "Tự đối trừ":
+                            st.caption("Khoản tự đối trừ được tính theo đơn nên không sửa hoặc hủy tại đây.")
+                        else:
+                            st.caption(f'Đã chọn: {payment["person_name"]} · {money(payment["amount"])}')
+                            edit_col, remove_col = st.columns(2)
+                            if edit_col.button("✏️ Sửa khoản thu", key=f'edit_payment_{payment["id"]}'):
+                                pending_edit = st.session_state.pop("editing_session_id", None)
+                                if pending_edit is not None:
+                                    st.session_state.pop(f'edit_rows_{pending_edit}', None)
+                                st.session_state.payment_dialog_action = ("edit", payment["id"])
+                                st.rerun()
+                            if remove_col.button("🗑️ Hủy khoản thu", key=f'delete_payment_{payment["id"]}'):
+                                pending_edit = st.session_state.pop("editing_session_id", None)
+                                if pending_edit is not None:
+                                    st.session_state.pop(f'edit_rows_{pending_edit}', None)
+                                st.session_state.payment_dialog_action = ("delete", payment["id"])
+                                st.rerun()
+                    else:
+                        st.caption("Chọn một dòng trong bảng để sửa hoặc hủy khoản thu.")
+            if actions.button("✏️ Sửa đơn", key=f'edit_session_{session["id"]}'):
+                st.session_state.pop("payment_dialog_action", None)
+                st.session_state.editing_session_id = session["id"]
+                st.rerun()
+            changes = changes_by_session[session["id"]]
+            payment_changes = payment_changes_by_session[session["id"]]
+            if changes or payment_changes:
+                with actions.popover(f"Lịch sử điều chỉnh ({len(changes) + len(payment_changes)})"):
+                    for change in changes:
+                        detail = json.loads(change["detail"])
+                        st.caption(f'Sửa đơn · {format_datetime(change["created_at"])} · {detail["before"]["session"]["title"]} → {detail["after"]["data"]["title"]}')
+                    for change, detail in payment_changes:
+                        before = detail["before"]
+                        after = detail["after"]
+                        result = "Đã hủy" if after is None else f'{money(before["amount"])} → {money(after["amount"])}'
+                        st.caption(f'{format_datetime(change["created_at"])} · {before["person_name"]} · {result} · {detail["reason"]}')
+            if actions.button("🗑️ Xóa đơn", key=f"delete_{session['id']}"):
                 confirm_delete(session)
+    prev_col, count_col, next_col = st.columns([1, 3, 1], vertical_alignment="center")
+    if prev_col.button("← Trước", key="history_previous", disabled=page <= 1, use_container_width=True):
+        st.session_state.history_page = page - 1
+        st.rerun()
+    count_col.caption(f"{total_count} đơn · Trang {page}/{total_pages}")
+    if next_col.button("Sau →", key="history_next", disabled=page >= total_pages, use_container_width=True):
+        st.session_state.history_page = page + 1
+        st.rerun()
 
 if active_page == "📚 Lịch sử":
     render_history()
+    payment_action = st.session_state.get("payment_dialog_action")
+    if payment_action:
+        selected_payment = db.query("SELECT * FROM payments WHERE id=?", (payment_action[1],))
+        if selected_payment:
+            if payment_action[0] == "edit":
+                edit_payment_dialog(selected_payment[0])
+            elif payment_action[0] == "delete":
+                delete_payment_dialog(selected_payment[0])
+        else:
+            st.session_state.pop("payment_dialog_action", None)
+    editing_session_id = st.session_state.get("editing_session_id")
+    if editing_session_id is not None and not payment_action:
+        editing_session = db.query("SELECT * FROM sessions WHERE id=?", (editing_session_id,))
+        if editing_session:
+            edit_session_dialog(editing_session[0])
+        else:
+            st.session_state.pop("editing_session_id", None)
 
 
 if active_page == "👥 Thành viên":
