@@ -43,6 +43,7 @@ class Database:
                     date TEXT, title TEXT, image_path TEXT DEFAULT '',
                     restaurant TEXT DEFAULT '', payer_member_id INTEGER,
                     subtotal INTEGER NOT NULL DEFAULT 0,
+                    tax_included INTEGER NOT NULL DEFAULT 0,
                     shipping_fee INTEGER NOT NULL DEFAULT 0,
                     discount INTEGER NOT NULL DEFAULT 0,
                     tip INTEGER NOT NULL DEFAULT 0,
@@ -122,6 +123,7 @@ class Database:
             "sessions": {
                 "image_path": "TEXT DEFAULT ''", "restaurant": "TEXT DEFAULT ''",
                 "payer_member_id": "INTEGER", "subtotal": "INTEGER NOT NULL DEFAULT 0",
+                "tax_included": "INTEGER NOT NULL DEFAULT 0",
                 "shipping_fee": "INTEGER NOT NULL DEFAULT 0", "discount": "INTEGER NOT NULL DEFAULT 0",
                 "tip": "INTEGER NOT NULL DEFAULT 0", "company_support": "INTEGER NOT NULL DEFAULT 0",
                 "allocation_method": "TEXT NOT NULL DEFAULT 'proportional'",
@@ -312,11 +314,11 @@ class Database:
                     raise ValueError("Không thể xóa món đã có người nhận.")
             before = {"session": dict(current), "items": list(old_items.values())}
             conn.execute(
-                """UPDATE sessions SET title=?,restaurant=?,payer_member_id=?,subtotal=?,shipping_fee=?,
+                """UPDATE sessions SET title=?,restaurant=?,payer_member_id=?,subtotal=?,tax_included=?,shipping_fee=?,
                    discount=?,tip=?,company_support=?,allocation_method=?,updated_at=?,revision=revision+1
                    WHERE id=?""",
                 (data["title"].strip(), data.get("restaurant", "").strip(), data["payer_member_id"],
-                 int(data["subtotal"]), int(data["shipping_fee"]), int(data["discount"]),
+                 int(data["subtotal"]), int(data.get("tax_included", 0)), int(data["shipping_fee"]), int(data["discount"]),
                  int(data["tip"]), int(data["company_support"]), data["allocation_method"], stamp, session_id),
             )
             for item in items:
@@ -416,6 +418,28 @@ class Database:
     def add_member(self, name, aliases="", department="", bank_account="", bank_name=""):
         return self.execute("INSERT INTO members(name,aliases,department,bank_account,bank_name,created_at) VALUES(?,?,?,?,?,?)", (name.strip(), aliases.strip(), department.strip(), bank_account.strip(), bank_name.strip(), now_iso()))
 
+    def delete_member(self, member_id):
+        """Remove an unused member; archive one referenced by billing history."""
+        with self.connect() as conn:
+            member = conn.execute("SELECT id FROM members WHERE id=?", (member_id,)).fetchone()
+            if not member:
+                raise ValueError("Thành viên không còn tồn tại.")
+            referenced = any(conn.execute(f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1", (member_id,)).fetchone()
+                             for table, column in (("sessions", "payer_member_id"), ("items", "member_id"),
+                                                   ("payments", "member_id"), ("advances", "member_id"),
+                                                   ("item_claims", "member_id")))
+            for template in conn.execute("SELECT id,member_ids FROM group_templates").fetchall():
+                member_ids = [value for value in template["member_ids"].split(",") if value]
+                updated_ids = [value for value in member_ids if value != str(member_id)]
+                if len(updated_ids) != len(member_ids):
+                    conn.execute("UPDATE group_templates SET member_ids=? WHERE id=?",
+                                 (",".join(updated_ids), template["id"]))
+            if referenced:
+                conn.execute("UPDATE members SET active=0 WHERE id=?", (member_id,))
+                return "archived"
+            conn.execute("DELETE FROM members WHERE id=?", (member_id,))
+            return "deleted"
+
     def find_member(self, name):
         target = self.normalize_name(name)
         members = self.query("SELECT * FROM members WHERE active=1")
@@ -504,9 +528,9 @@ class Database:
         stamp = now_iso()
         with self.connect() as conn:
             cur = conn.execute(
-                """INSERT INTO sessions(date,title,image_path,restaurant,payer_member_id,subtotal,shipping_fee,discount,tip,company_support,allocation_method,payment_method,notes,share_token,status,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (datetime.now().strftime("%d/%m/%Y %H:%M"), data["title"], image_path, data.get("restaurant", ""), data.get("payer_member_id"), data["subtotal"], data["shipping_fee"], data["discount"], data["tip"], data["company_support"], data["allocation_method"], data.get("payment_method", ""), data.get("notes", ""), uuid.uuid4().hex, "open", stamp, stamp),
+                """INSERT INTO sessions(date,title,image_path,restaurant,payer_member_id,subtotal,tax_included,shipping_fee,discount,tip,company_support,allocation_method,payment_method,notes,share_token,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now().strftime("%d/%m/%Y %H:%M"), data["title"], image_path, data.get("restaurant", ""), data.get("payer_member_id"), data["subtotal"], data.get("tax_included", 0), data["shipping_fee"], data["discount"], data["tip"], data["company_support"], data["allocation_method"], data.get("payment_method", ""), data.get("notes", ""), uuid.uuid4().hex, "open", stamp, stamp),
             )
             session_id = cur.lastrowid
             for item in items:

@@ -5,6 +5,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 def money(value):
@@ -15,6 +16,31 @@ def parse_money(value):
     if isinstance(value, (int, float)):
         return max(0, int(value))
     return max(0, int(re.sub(r"\D", "", str(value)) or 0))
+
+
+def amount_from_percentage(total, percentage):
+    """Convert a percentage to whole VND, rounding half a đồng upward."""
+    total = max(0, int(total))
+    percentage = min(Decimal("100"), max(Decimal("0"), Decimal(str(percentage))))
+    return int((Decimal(total) * percentage / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def redistribute_custom_shares(total, member_ids, edited_id, edited_amount):
+    """Keep one person's share and split the exact remainder across everyone else."""
+    total = max(0, int(total))
+    ids = [str(member_id) for member_id in member_ids]
+    edited_id = str(edited_id)
+    if edited_id not in ids or len(ids) != len(set(ids)):
+        raise ValueError("Danh sách người cùng đóng không hợp lệ.")
+    if len(ids) == 1:
+        return {edited_id: total}
+    amount = min(total, parse_money(edited_amount))
+    others = [member_id for member_id in ids if member_id != edited_id]
+    base, remainder = divmod(total - amount, len(others))
+    result = {edited_id: amount}
+    result.update({member_id: base + (index < remainder)
+                   for index, member_id in enumerate(others)})
+    return result
 
 
 def bill_signature(restaurant, items, total):
@@ -151,13 +177,58 @@ def allocate_group(participants, total, custom_amounts=None):
     ]
 
 
-def excel_report(sessions, debt_rows):
+def excel_report(debt_rows):
     import pandas as pd
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(sessions).to_excel(writer, sheet_name="Đơn hàng", index=False)
-        pd.DataFrame(debt_rows).to_excel(writer, sheet_name="Công nợ", index=False)
+        pd.DataFrame(debt_rows).to_excel(writer, sheet_name="Chi tiết công nợ", index=False)
+        sheet = writer.sheets["Chi tiết công nợ"]
+        sheet.freeze_panes = "D2"
+        widths = {"Mã đơn": 14, "Ngày": 18, "Đơn": 36, "Người": 28,
+                  "Phải trả": 20, "Đã trả": 20, "Còn nợ": 20}
+        headers = {cell.value: cell.column for cell in sheet[1]}
+        for cell in sheet[1]:
+            cell.fill = PatternFill("solid", fgColor="173042")
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            sheet.column_dimensions[get_column_letter(cell.column)].width = widths.get(cell.value, 20)
+        sheet.row_dimensions[1].height = 28
+
+        border = Border(bottom=Side(style="hair", color="DCE5EA"))
+        order_separator = Side(style="medium", color="8FA8B5")
+        amount_columns = [headers[name] for name in ("Phải trả", "Đã trả", "Còn nợ") if name in headers]
+        for row_number in range(2, sheet.max_row + 1):
+            sheet.row_dimensions[row_number].height = 25
+            for cell in sheet[row_number]:
+                cell.fill = PatternFill("solid", fgColor="F3F7F9" if row_number % 2 == 0 else "FFFFFF")
+                cell.border = border
+                cell.alignment = Alignment(vertical="center")
+            for column in amount_columns:
+                cell = sheet.cell(row_number, column)
+                cell.number_format = '#,##0" ₫"'
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+
+        if "Mã đơn" in headers:
+            first_row = 2
+            while first_row <= sheet.max_row:
+                last_row = first_row
+                order_id = sheet.cell(first_row, headers["Mã đơn"]).value
+                while last_row < sheet.max_row and sheet.cell(last_row + 1, headers["Mã đơn"]).value == order_id:
+                    last_row += 1
+                if last_row > first_row:
+                    for name in ("Mã đơn", "Ngày", "Đơn"):
+                        if name in headers:
+                            column = get_column_letter(headers[name])
+                            sheet.merge_cells(f"{column}{first_row}:{column}{last_row}")
+                            sheet.cell(first_row, headers[name]).alignment = Alignment(vertical="center")
+                if first_row > 2:
+                    for cell in sheet[first_row]:
+                        cell.border = Border(top=order_separator, bottom=cell.border.bottom,
+                                             left=cell.border.left, right=cell.border.right)
+                first_row = last_row + 1
     return output.getvalue()
 
 

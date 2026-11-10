@@ -72,6 +72,8 @@ button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover { backgroun
   .bm-people { grid-template-columns: 1fr; }
   [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: .75rem; }
   [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { width: 100% !important; flex: 1 1 100% !important; min-width: 0 !important; }
+  [class*="st-key-member_card_"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .5rem; }
+  [class*="st-key-member_card_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { width: auto !important; flex: 1 1 0 !important; }
   [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="stColumn"] { flex: 1 1 calc(50% - .75rem) !important; width: calc(50% - .75rem) !important; }
   [data-testid="stMetric"] { padding: 14px; min-height: 100px; }
   [data-testid="stMetricValue"] { font-size: 22px; }

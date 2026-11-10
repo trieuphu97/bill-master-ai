@@ -97,6 +97,13 @@ class AppRegressionTests(unittest.TestCase):
             with self.subTest(page=page):
                 self.go(page)
 
+    def test_member_rows_have_their_own_delete_buttons(self):
+        self.go("👥 Thành viên")
+        buttons = {button.key for button in self.app.button}
+        self.assertIn(f"delete_member_{self.payer}", buttons)
+        self.assertIn(f"delete_member_{self.member}", buttons)
+        self.assertNotIn("delete_member_button", buttons)
+
     def test_history_pagination_controls(self):
         for number in range(11):
             rows = allocate_items([{'member_id': self.member, 'person_name': 'Bình',
@@ -125,6 +132,7 @@ class AppRegressionTests(unittest.TestCase):
 
     def test_manual_order_save_resets_and_updates_overview(self):
         self.go('➕ Đơn mới')
+        self.assertEqual(self.field(self.app.metric, 'Tổng tạm tính').value, '0 đ')
         self.field(self.app.selectbox, 'Người ứng tiền').set_value('An')
         self.field(self.app.selectbox, 'Người').set_value('Bình')
         self.field(self.app.text_input, 'Món').set_value('Bún')
@@ -134,8 +142,43 @@ class AppRegressionTests(unittest.TestCase):
         self.assertEqual(len(self.db.query('SELECT * FROM sessions')), 2)
         self.assertEqual(self.db.query('SELECT subtotal FROM sessions ORDER BY id DESC')[0]['subtotal'], 55000)
         self.assertEqual(self.field(self.app.text_input, 'Món').value, '')
+        self.assertNotIn('new_bill_scroll', self.app.session_state)
+        self.assertTrue(any('Đã lưu đơn' in alert.value for alert in self.app.success))
         self.go('📊 Tổng quan')
         self.assertEqual(self.app.metric[1].value, '155,000 đ')
+
+    def test_new_bill_scroll_request_is_consumed_after_render(self):
+        self.app.session_state['new_bill_scroll'] = ('review', 'test-scroll')
+        self.go('➕ Đơn mới')
+        self.assertNotIn('new_bill_scroll', self.app.session_state)
+
+    def test_new_bill_shows_scanned_total_and_difference_before_saving(self):
+        self.app.session_state['draft'] = {
+            'restaurant': 'Quán thử', 'subtotal': 30_000, 'total': 35_000,
+            'shipping_fee': 0, 'discount': 0, 'tip': 0,
+            'items': [{'person_name': 'Bình', 'item_name': 'Trà', 'quantity': 1, 'unit_price': 30_000}],
+        }
+        self.go('➕ Đơn mới')
+        self.assertEqual(self.field(self.app.metric, 'App tính từ các món').value, '30,000 đ')
+        self.assertEqual(self.field(self.app.metric, 'AI đọc từ hóa đơn').value, '35,000 đ')
+        self.assertEqual(self.field(self.app.metric, 'Chênh lệch').value, '5,000 đ')
+        self.assertTrue(any('Tổng tiền chưa khớp' in message.value for message in self.app.error))
+
+    def test_item_count_accepts_total_quantity_not_just_line_count(self):
+        self.app.session_state['draft'] = {
+            'restaurant': 'Quán thử', 'item_count': 3, 'subtotal': 80_000, 'total': 80_000,
+            'shipping_fee': 0, 'discount': 0, 'tip': 0,
+            'items': [
+                {'person_name': 'Bình', 'item_name': 'Trà', 'quantity': 2, 'unit_price': 30_000},
+                {'person_name': 'An', 'item_name': 'Bánh', 'quantity': 1, 'unit_price': 20_000},
+            ],
+        }
+        self.go('➕ Đơn mới')
+        self.assertFalse(any('AI đọc 3 món nhưng form' in warning.value for warning in self.app.warning))
+        self.app.session_state['draft']['item_count'] = 4
+        self.app.run()
+        self.assertHealthy()
+        self.assertTrue(any('AI đọc 4 món nhưng form' in warning.value for warning in self.app.warning))
 
     def test_reset_new_bill_discards_draft_without_deleting_saved_orders(self):
         self.go('➕ Đơn mới')
@@ -155,6 +198,27 @@ class AppRegressionTests(unittest.TestCase):
         self.assertNotIn('scan_signature', self.app.session_state)
         self.assertEqual(self.app.session_state['input_version'], previous_version + 1)
         self.assertEqual(len(self.db.query('SELECT * FROM sessions')), 1)
+
+    def test_vat_bill_uses_tax_inclusive_item_prices_without_adding_tax_twice(self):
+        self.app.session_state['draft'] = {
+            'restaurant': 'Mơ Nướng', 'subtotal': 354_240, 'tax_included': 26_240,
+            'shipping_fee': 0, 'discount': 0, 'tip': 0, 'total': 354_240,
+            'items': [
+                {'person_name': 'Bình', 'item_name': 'Bánh phồng tôm', 'quantity': 3,
+                 'unit_price': 10_800},
+                {'person_name': 'An', 'item_name': 'Gỏi ngó sen', 'quantity': 2,
+                 'unit_price': 160_920},
+            ],
+        }
+        self.go('➕ Đơn mới')
+        self.assertEqual(self.field(self.app.text_input, 'Thuế GTGT').value, '26,240')
+        self.assertEqual(self.field(self.app.text_input, 'Đơn giá').value, '10,800')
+        self.assertEqual(self.field(self.app.text_input, 'Quán').value, 'Mơ Nướng')
+        self.field(self.app.selectbox, 'Người ứng tiền').set_value('An')
+        self.button('Tính và lưu đơn').click().run()
+        self.assertHealthy()
+        saved = self.db.query('SELECT subtotal,tax_included FROM sessions ORDER BY id DESC LIMIT 1')[0]
+        self.assertEqual((saved['subtotal'], saved['tax_included']), (354_240, 26_240))
 
     def test_one_dong_promo_option_keeps_receipt_total(self):
         self.app.session_state['draft'] = {
@@ -218,6 +282,88 @@ class AppRegressionTests(unittest.TestCase):
             self.assertTrue(self.app.multiselect)
             mode = self.field(self.app.radio, 'Cách tính công nợ')
 
+    def test_custom_group_amount_and_percentage_rebalance_automatically(self):
+        third_member = self.db.add_member('Cường')
+        self.go('➕ Đơn mới')
+        self.field(self.app.text_input, 'Món').set_value('Liên hoan')
+        self.field(self.app.text_input, 'Đơn giá').set_value('100,000')
+        self.field(self.app.selectbox, 'Người ứng tiền').set_value('An')
+        self.field(self.app.radio, 'Cách tính công nợ').set_value('Nhập số tiền từng người').run()
+        self.assertHealthy()
+        self.field(self.app.multiselect, 'Người cùng đóng').set_value(
+            [self.payer, self.member, third_member]
+        ).run()
+        self.assertHealthy()
+        self.app.text_input(key=f'group_amount_0_{self.payer}').set_value('abc').run()
+        self.assertHealthy()
+        self.assertTrue(any('Chỉ nhập số tiền hoặc phần trăm' in error.value for error in self.app.error))
+        self.assertEqual(self.app.text_input(key=f'group_amount_0_{self.payer}').value, '33,334')
+        self.app.text_input(key=f'group_amount_0_{self.payer}').set_value('60,000').run()
+        self.assertHealthy()
+        state = self.app.session_state['group_custom_state_0']['amounts']
+        self.assertEqual(state, {str(self.payer): 60_000, str(self.member): 20_000,
+                                 str(third_member): 20_000})
+        self.assertFalse(any(field.label == 'Cách nhập phần đóng' for field in self.app.radio))
+        self.app.text_input(key=f'group_amount_0_{self.payer}').set_value('50%').run()
+        self.assertHealthy()
+        state = self.app.session_state['group_custom_state_0']['amounts']
+        self.assertEqual(state, {str(self.payer): 50_000, str(self.member): 25_000,
+                                 str(third_member): 25_000})
+        self.assertEqual(self.app.text_input(key=f'group_amount_0_{self.payer}').value, '50,000')
+        self.field(self.app.text_input, 'Đơn giá').set_value('120,000').run()
+        self.assertHealthy()
+        state = self.app.session_state['group_custom_state_0']['amounts']
+        self.assertEqual(state, {str(self.payer): 60_000, str(self.member): 30_000,
+                                 str(third_member): 30_000})
+        self.button('Tính và lưu đơn').click().run()
+        self.assertHealthy()
+        saved = self.db.query('SELECT id FROM sessions ORDER BY id DESC LIMIT 1')[0]
+        contributions = self.db.query(
+            "SELECT person_name,amount_due FROM items WHERE session_id=? "
+            "AND item_name='Phần đóng góp chi phí chung' ORDER BY id", (saved['id'],),
+        )
+        self.assertEqual([row['amount_due'] for row in contributions], [60_000, 30_000, 30_000])
+
+    def test_split_item_prefills_first_person_and_allows_unknown_second(self):
+        self.app.session_state['draft'] = {
+            'restaurant': 'Quán trà', 'subtotal': 40_000, 'total': 40_000,
+            'shipping_fee': 0, 'discount': 0, 'tip': 0,
+            'items': [{'person_name': 'Bình', 'item_name': 'Trà chanh',
+                       'quantity': 2, 'unit_price': 20_000}],
+        }
+        self.go('➕ Đơn mới')
+        self.field(self.app.selectbox, 'Người ứng tiền').set_value('An')
+        self.field(self.app.radio, 'Phân bổ').set_value('Chia cho nhiều người').run()
+        self.assertHealthy()
+        self.assertEqual(self.field(self.app.selectbox, 'Người 1').value, 'Bình')
+        self.assertEqual(self.field(self.app.selectbox, 'Người 2').value, 'Chưa xác định')
+        self.assertTrue(any('1 phần chưa xác định' in alert.value for alert in self.app.info))
+        self.button('Tính và lưu đơn').click().run()
+        self.assertHealthy()
+        saved = self.db.query('SELECT id FROM sessions ORDER BY id DESC LIMIT 1')[0]
+        rows = self.db.query('SELECT person_name,quantity,amount_due FROM items WHERE session_id=? ORDER BY id',
+                             (saved['id'],))
+        self.assertEqual([(row['person_name'], row['quantity']) for row in rows],
+                         [('Bình', 1), ('Chưa xác định', 1)])
+        self.assertEqual(sum(row['amount_due'] for row in rows), 40_000)
+
+    def test_split_item_can_save_when_all_people_are_unknown(self):
+        self.app.session_state['draft'] = {
+            'restaurant': 'Quán trà', 'subtotal': 40_000, 'total': 40_000,
+            'shipping_fee': 0, 'discount': 0, 'tip': 0,
+            'items': [{'person_name': 'Chưa xác định', 'item_name': 'Trà chanh',
+                       'quantity': 2, 'unit_price': 20_000}],
+        }
+        self.go('➕ Đơn mới')
+        self.field(self.app.selectbox, 'Người ứng tiền').set_value('An')
+        self.field(self.app.radio, 'Phân bổ').set_value('Chia cho nhiều người').run()
+        self.assertHealthy()
+        self.assertEqual(self.field(self.app.selectbox, 'Người 1').value, 'Chưa xác định')
+        self.assertEqual(self.field(self.app.selectbox, 'Người 2').value, 'Chưa xác định')
+        self.button('Tính và lưu đơn').click().run()
+        self.assertHealthy()
+        self.assertEqual(len(self.db.query("SELECT id FROM sessions WHERE title LIKE 'Đồ ăn ngày %'")), 1)
+
     def test_shared_page_has_claim_controls_and_no_admin_navigation(self):
         token = self.db.query('SELECT share_token FROM sessions WHERE id=?', (self.session_id,))[0]['share_token']
         shared = AppTest.from_file('app.py', default_timeout=15)
@@ -246,6 +392,24 @@ class AppRegressionTests(unittest.TestCase):
         self.assertHealthy()
         self.assertIsNotNone(self.button('Xác nhận đã nhận'))
         self.assertFalse(self.db.query('SELECT * FROM payments WHERE member_id=?', (self.member,)))
+
+    def test_payment_dialog_records_partial_payment(self):
+        self.go('📚 Lịch sử')
+        self.button('Nhận tiền · Bình').click().run()
+        self.assertHealthy()
+        self.field(self.app.text_input, 'Số tiền nhận').set_value('10,000').run()
+        self.assertHealthy()
+        self.button('Xác nhận đã nhận').click().run()
+        self.assertHealthy()
+        received = self.db.query('SELECT amount FROM payments WHERE member_id=?', (self.member,))
+        self.assertEqual([row['amount'] for row in received], [10_000])
+
+    def test_payment_dialog_uses_fresh_remaining_balance(self):
+        self.db.add_payment(self.session_id, self.member, 'Bình', 10_000, 'Chuyển khoản')
+        self.go('📚 Lịch sử')
+        self.button('Nhận tiền · Bình').click().run()
+        self.assertHealthy()
+        self.assertEqual(self.field(self.app.text_input, 'Số tiền nhận').value, '30,000')
 
     def test_duplicate_bill_requires_explicit_acknowledgement(self):
         self.go('➕ Đơn mới')

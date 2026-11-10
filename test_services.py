@@ -1,12 +1,78 @@
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
+from openpyxl import load_workbook
+
 from database import Database
-from services import allocate_group, allocate_items, allocate_items_with_shared_promos, person_balances, shared_promo_discount
+from services import allocate_group, allocate_items, allocate_items_with_shared_promos, amount_from_percentage, excel_report, redistribute_custom_shares, person_balances, shared_promo_discount
 
 
 class BillingTests(unittest.TestCase):
+    def test_delete_member_removes_unused_member_and_template_reference(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "members.db")
+            database.init()
+            member_id = database.add_member("An")
+            database.execute("INSERT INTO group_templates(name,member_ids,created_at) VALUES(?,?,?)",
+                             ("Nhóm", str(member_id), "2026-10-22"))
+            self.assertEqual(database.delete_member(member_id), "deleted")
+            self.assertEqual(database.query("SELECT * FROM members WHERE id=?", (member_id,)), [])
+            self.assertEqual(database.query("SELECT member_ids FROM group_templates")[0]["member_ids"], "")
+
+    def test_delete_member_with_order_archives_without_losing_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            database = Database(Path(folder) / "members.db")
+            database.init()
+            member_id = database.add_member("An")
+            session_id = database.execute("INSERT INTO sessions(payer_member_id,title) VALUES(?,?)",
+                                          (member_id, "Đơn cũ"))
+            self.assertEqual(database.delete_member(member_id), "archived")
+            self.assertEqual(database.query("SELECT active FROM members WHERE id=?", (member_id,))[0]["active"], 0)
+            self.assertEqual(database.query("SELECT payer_member_id FROM sessions WHERE id=?", (session_id,))[0]["payer_member_id"], member_id)
+
+    def test_excel_export_matches_csv_detail_columns_and_values(self):
+        rows = [{"Mã đơn": 12, "Ngày": "2026-10-22", "Đơn": "Đồ ăn",
+                 "Người": "An", "Phải trả": 54000, "Đã trả": 40000, "Còn nợ": 14000}]
+        workbook = load_workbook(BytesIO(excel_report(rows)), read_only=True, data_only=True)
+        self.assertEqual(workbook.sheetnames, ["Chi tiết công nợ"])
+        self.assertEqual(list(workbook.active.values), [tuple(rows[0]), tuple(rows[0].values())])
+
+    def test_excel_export_merges_order_fields_and_formats_vnd(self):
+        rows = [
+            {"Mã đơn": 12, "Ngày": "2026-10-22", "Đơn": "Đồ ăn", "Người": person,
+             "Phải trả": amount, "Đã trả": 0, "Còn nợ": amount}
+            for person, amount in [("An", 54000), ("Bình", 36000)]
+        ]
+        rows.append({"Mã đơn": 13, "Ngày": "2026-10-23", "Đơn": "Trà",
+                     "Người": "An", "Phải trả": 20000, "Đã trả": 20000, "Còn nợ": 0})
+        workbook = load_workbook(BytesIO(excel_report(rows)), data_only=True)
+        sheet = workbook.active
+        self.assertEqual({str(region) for region in sheet.merged_cells.ranges},
+                         {"A2:A3", "B2:B3", "C2:C3"})
+        self.assertEqual((sheet["A2"].value, sheet["A4"].value), (12, 13))
+        self.assertEqual((sheet["E2"].value, sheet["E3"].value), (54000, 36000))
+        self.assertEqual(sheet["E2"].number_format, '#,##0" ₫"')
+        self.assertEqual(sheet["G4"].number_format, '#,##0" ₫"')
+        self.assertTrue(sheet["A1"].font.bold)
+        self.assertEqual(sheet["D4"].border.top.style, "medium")
+        self.assertIsNone(sheet["D3"].border.top)
+
+    def test_custom_group_share_redistributes_exact_remainder(self):
+        shares = redistribute_custom_shares(100_001, [1, 2, 3], 1, 50_000)
+        self.assertEqual(shares, {'1': 50_000, '2': 25_001, '3': 25_000})
+        self.assertEqual(sum(shares.values()), 100_001)
+        self.assertEqual(redistribute_custom_shares(100_000, [1, 2], 1, 200_000),
+                         {'1': 100_000, '2': 0})
+        self.assertEqual(redistribute_custom_shares(100_000, [1], 1, 30_000), {'1': 100_000})
+
+    def test_percentage_share_is_rounded_to_vnd_and_rest_redistributed(self):
+        boss_amount = amount_from_percentage(100_001, 50)
+        self.assertEqual(boss_amount, 50_001)
+        shares = redistribute_custom_shares(100_001, [1, 2, 3], 1, boss_amount)
+        self.assertEqual(shares, {'1': 50_001, '2': 25_000, '3': 25_000})
+
     def test_one_dong_item_uses_original_price_and_shares_savings(self):
         prices = [69_000, 54_000, 54_000, 54_000, 1, 54_000, 69_000]
         items = [
